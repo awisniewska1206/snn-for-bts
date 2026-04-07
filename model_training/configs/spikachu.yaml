@@ -1,0 +1,43 @@
+experiment_tag: 'SpikingJelly_snn'
+
+seed: 42
+wandb_mode: 'disabled'
+model:
+  type: "SpikingJellySNN"
+  enable_benchmarking: True
+  setup:
+    surrogate: 'atan'  # 'atan' or 'sigmoid'
+    sparsity_loss_weight: 0.0 # 0.0 disables sparsity loss
+    sparsity_loss: 'l2'  # 'l1' or 'l2'
+    backend: 'cupy'  # 'cupy' or 'torch'
+    input_size: 512
+    pre_trained_path: ~
+    finetune_with_unit_identification: False
+
+    multi_scale_snn:
+      list_of_taus_ms: [5.0]
+      v_threshold: 0.75
+      v_reset: 0.
+      input_size: ${model.setup.input_size}
+      hidden_size: 512
+      output_size: 512
+      n_layers: 6
+      skip_step: 2
+      p_drop: 0.0
+
+    feed_forward:
+     tau: 2.0
+     v_threshold: 0.75
+     v_reset: 0.
+     input_size: 512
+     hidden_size: ~
+     output_size: 384
+     n_layers: 1
+     skip_step: ~
+     p_drop: ~
+
+    output_tau: 2.
+    pre_output_size: 384
+    output_size: 41
+
+save_path: "trained_models/"

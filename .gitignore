@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+logs/
+data/
+language_model/
+nejm_b2txt_utils/
+environment.yml
+.vscode/
+model_training_old/
+.codex
