@@ -9,7 +9,7 @@ from spikingjelly.activation_based import functional
 from spikingjelly.activation_based import layer, surrogate
 import torch.nn.functional as F
 
-from models.neurons import LTLIFNode, MultiTauLIFNode
+from models.neurons import LTLIFNode, MultiTauLIFNode, _tau_to_w_value
 import pandas as pd
 
 def pick_surrogate(surr_name: str):
@@ -28,30 +28,43 @@ class LaggedMixer(nn.Module):
         channels,
         lags=(0, 1, 2, 4),
         one_random_lag_per_pair=False,
+        num_lags_per_connection=1,
+        lag_distribution_type="uniform",
+        lag_decay_strength=1.0,
         seed=0,
     ):
         super().__init__()
         self.lags = list(lags)
         self.channels = channels
         self.K = len(self.lags)
+        self.lag_distribution_type = str(lag_distribution_type)
+        self.lag_decay_strength = float(lag_decay_strength)
+        self.one_random_lag_per_pair = bool(one_random_lag_per_pair)
+        self.num_lags_per_connection = max(1, int(num_lags_per_connection))
 
         self.mix = nn.Linear(channels * self.K, channels)
 
         print(lags)
 
-        # ---- create mask (reproducible) ----
-        g = torch.Generator()
-        g.manual_seed(seed)
-
         mask = torch.ones(channels, channels * self.K)
 
         if one_random_lag_per_pair:
             mask.zero_()
+            lag_probs = self._normalized_lag_probabilities()
+            num_lags_to_sample = min(self.num_lags_per_connection, self.K)
+            with torch.random.fork_rng():
+                torch.manual_seed(seed)
+                sampled_lag_indices = torch.multinomial(
+                    lag_probs.expand(channels * channels, -1),
+                    num_samples=num_lags_to_sample,
+                    replacement=False,
+                ).view(channels, channels, num_lags_to_sample)
             for out_ch in range(channels):
                 for in_ch in range(channels):
-                    k_idx = torch.randint(0, self.K, (1,), generator=g).item()
-                    col = k_idx * channels + in_ch
-                    mask[out_ch, col] = 1.0
+                    for sample_idx in range(num_lags_to_sample):
+                        k_idx = int(sampled_lag_indices[out_ch, in_ch, sample_idx].item())
+                        col = k_idx * channels + in_ch
+                        mask[out_ch, col] = 1.0
 
         self.register_buffer("mask", mask)
         self.register_buffer("inference_lag_mask", torch.ones(self.K), persistent=False)
@@ -63,6 +76,33 @@ class LaggedMixer(nn.Module):
 
         # ---- mask gradients ----
         self.mix.weight.register_hook(lambda grad: grad * self.mask)
+
+    def _normalized_lag_probabilities(self):
+        lag_values = torch.tensor(self.lags, dtype=torch.float32)
+
+        if self.lag_distribution_type == "uniform":
+            probs = torch.ones_like(lag_values)
+        elif self.lag_distribution_type == "short-biased":
+            probs = lag_values.max() - lag_values + 1.0
+        elif self.lag_distribution_type == "long-biased":
+            probs = lag_values - lag_values.min() + 1.0
+        elif self.lag_distribution_type == "center-biased":
+            center = lag_values.mean()
+            probs = 1.0 / (1.0 + (lag_values - center).abs())
+        elif self.lag_distribution_type == "decaying":
+            min_lag = lag_values.min()
+            probs = torch.exp(-self.lag_decay_strength * (lag_values - min_lag))
+        else:
+            raise ValueError(
+                f"Unsupported lag_distribution_type: {self.lag_distribution_type}. "
+                "Expected one of {'uniform', 'short-biased', 'long-biased', "
+                "'center-biased', 'decaying'}."
+            )
+
+        prob_sum = probs.sum()
+        if prob_sum <= 0:
+            raise ValueError("Lag sampling probabilities must sum to a positive value.")
+        return probs / prob_sum
 
     def set_inference_lag_mask(self, lag_mask):
         lag_mask = torch.as_tensor(lag_mask, dtype=self.mask.dtype, device=self.mask.device)
@@ -96,6 +136,7 @@ class LaggedMixer(nn.Module):
                     {
                         "out_channel": out_ch,
                         "in_channel": in_ch,
+                        "requested_num_lags_per_connection": int(self.num_lags_per_connection),
                         "num_selected_lags": len(active_lags),
                         "selected_lag_indices": "|".join(str(k_idx) for k_idx in active_lag_indices),
                         "selected_lags": "|".join(str(lag) for lag in active_lags),
@@ -144,6 +185,10 @@ class LaggedMixer(nn.Module):
             "lags": list(self.lags),
             "channels": int(self.channels),
             "num_lags": int(self.K),
+            "lag_distribution_type": self.lag_distribution_type,
+            "lag_decay_strength": float(self.lag_decay_strength),
+            "one_random_lag_per_pair": self.one_random_lag_per_pair,
+            "num_lags_per_connection": int(self.num_lags_per_connection),
             "selection_rows": self.get_lag_selection_rows(),
             "distribution_rows": self.get_lag_distribution_rows(),
         }
@@ -561,6 +606,9 @@ class ResidualSNNBlock(nn.Module):
         channels: int,
         lagged_lags=(0, 1, 2, 3, 4, 5, 6, 7),
         lagged_one_random_lag_per_pair: bool = False,
+        lagged_num_lags_per_connection: int = 1,
+        lagged_distribution_type: str = "uniform",
+        lagged_decay_strength: float = 1.0,
         lagged_seed: int = 0,
         p_drop: float = 0.0,
         surrogate_func: str = "atan",
@@ -574,6 +622,9 @@ class ResidualSNNBlock(nn.Module):
             channels,
             lags=tuple(int(lag) for lag in lagged_lags),
             one_random_lag_per_pair=lagged_one_random_lag_per_pair,
+            num_lags_per_connection=lagged_num_lags_per_connection,
+            lag_distribution_type=lagged_distribution_type,
+            lag_decay_strength=lagged_decay_strength,
             seed=int(lagged_seed),
         )
         self.neuron = LTLIFNode(
@@ -694,10 +745,19 @@ class SpikingNeuralNet(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
+        self.cfg = cfg
         setup = cfg.model.setup
         self._step = 0
+        self._shared_neuron_params = {}
+        self._neuron_adaptation = {
+            "enabled": False,
+            "learn_threshold": False,
+            "learn_tau": False,
+        }
 
         hidden_size = setup.hidden_size
+        block_lag_configs = self._resolve_block_lag_configs(setup)
+        lagged_seed = int(cfg.get("seed", 0))
 
         self.input_proj = nn.Linear(setup.input_size*setup.patch_size, hidden_size)
 
@@ -708,14 +768,17 @@ class SpikingNeuralNet(nn.Module):
                     v_threshold=setup.snn_core.v_threshold,
                     v_reset=setup.snn_core.v_reset,
                     channels=hidden_size,
-                    lagged_lags=setup.snn_core.lagged_lags,
+                    lagged_lags=block_lag_configs[block_idx]["lags"],
                     lagged_one_random_lag_per_pair=setup.snn_core.lagged_one_random_lag_per_pair,
-                    lagged_seed=20,
+                    lagged_num_lags_per_connection=block_lag_configs[block_idx]["num_lags_per_connection"],
+                    lagged_distribution_type=block_lag_configs[block_idx]["distribution_type"],
+                    lagged_decay_strength=block_lag_configs[block_idx]["decay_strength"],
+                    lagged_seed=lagged_seed,
                     p_drop=setup.snn_core.p_drop,
                     surrogate_func=setup.surrogate,
                     backend=setup.backend,
                 )
-                for _ in range(setup.snn_core.n_blocks)
+                for block_idx in range(setup.snn_core.n_blocks)
             ]
         )
 
@@ -731,6 +794,109 @@ class SpikingNeuralNet(nn.Module):
             "[SNN] enabled blocks:",
             ["input_proj", f"snn_core_x{setup.snn_core.n_blocks}", "classifier"],
         )
+        self._configure_neuron_adaptation(setup)
+
+    def iter_lif_nodes(self):
+        for module in self.modules():
+            if isinstance(module, LTLIFNode):
+                yield module
+
+    def _configure_neuron_adaptation(self, setup):
+        lif_nodes = list(self.iter_lif_nodes())
+        if not lif_nodes:
+            return
+
+        adaptation_cfg = getattr(setup, "neuron_adaptation", None)
+        enabled = bool(adaptation_cfg.get("enabled", False)) if adaptation_cfg is not None else False
+        learn_threshold = enabled and bool(adaptation_cfg.get("learn_threshold", False))
+        learn_tau = enabled and bool(adaptation_cfg.get("learn_tau", False))
+
+        self._neuron_adaptation = {
+            "enabled": enabled,
+            "learn_threshold": learn_threshold,
+            "learn_tau": learn_tau,
+        }
+
+        if not enabled:
+            for node in lif_nodes:
+                node.v_threshold.requires_grad_(False)
+                node.w.requires_grad_(False)
+            return
+
+        if learn_threshold:
+            shared_threshold = nn.Parameter(
+                lif_nodes[0].v_threshold.detach().clone(),
+                requires_grad=True,
+            )
+            self._shared_neuron_params["v_threshold"] = shared_threshold
+            for node in lif_nodes:
+                node.v_threshold = shared_threshold
+        else:
+            for node in lif_nodes:
+                node.v_threshold.requires_grad_(False)
+
+        if learn_tau:
+            initial_tau = float(lif_nodes[0].get_tau().detach().mean().item())
+            tau_min = float(adaptation_cfg.get("tau_min", max(1.0001, initial_tau * 0.5)))
+            tau_max = float(adaptation_cfg.get("tau_max", max(tau_min + 1e-6, initial_tau * 2.0)))
+            shared_w = nn.Parameter(
+                torch.tensor(_tau_to_w_value(initial_tau), dtype=lif_nodes[0].w.dtype),
+                requires_grad=True,
+            )
+            self._shared_neuron_params["w"] = shared_w
+            self._neuron_adaptation["tau_min"] = tau_min
+            self._neuron_adaptation["tau_max"] = tau_max
+            for node in lif_nodes:
+                node.w = shared_w
+                node.set_tau_bounds(tau_min=tau_min, tau_max=tau_max)
+        else:
+            for node in lif_nodes:
+                node.w.requires_grad_(False)
+
+        print("[SNN] neuron_adaptation:", self._neuron_adaptation)
+
+    def _resolve_block_lag_configs(self, setup):
+        default_lags = tuple(int(lag) for lag in setup.snn_core.lagged_lags)
+        default_distribution_type = str(setup.snn_core.get("lagged_distribution_type", "uniform"))
+        default_decay_strength = float(setup.snn_core.get("lagged_decay_strength", 1.0))
+        default_num_lags_per_connection = int(setup.snn_core.get("lagged_num_lags_per_connection", 1))
+        per_block_cfgs = setup.snn_core.get("block_lag_configs", None)
+
+        if per_block_cfgs is None:
+            return [
+                {
+                    "lags": default_lags,
+                    "distribution_type": default_distribution_type,
+                    "decay_strength": default_decay_strength,
+                    "num_lags_per_connection": default_num_lags_per_connection,
+                }
+                for _ in range(int(setup.snn_core.n_blocks))
+            ]
+
+        if len(per_block_cfgs) != int(setup.snn_core.n_blocks):
+            raise ValueError(
+                "block_lag_configs must have one entry per residual block: "
+                f"expected {int(setup.snn_core.n_blocks)}, got {len(per_block_cfgs)}"
+            )
+
+        resolved_configs = []
+        for block_idx, block_cfg in enumerate(per_block_cfgs):
+            lags = block_cfg.get("lags", default_lags)
+            distribution_type = block_cfg.get("distribution_type", default_distribution_type)
+            decay_strength = float(block_cfg.get("decay_strength", default_decay_strength))
+            num_lags_per_connection = int(
+                block_cfg.get("num_lags_per_connection", default_num_lags_per_connection)
+            )
+            resolved_configs.append(
+                {
+                    "lags": tuple(int(lag) for lag in lags),
+                    "distribution_type": str(distribution_type),
+                    "decay_strength": decay_strength,
+                    "num_lags_per_connection": num_lags_per_connection,
+                }
+            )
+
+        return resolved_configs
 
     def get_average_spiking_rate(self):
         all_srs = 0.0
@@ -792,6 +958,19 @@ class SpikingNeuralNet(nn.Module):
                 print(line)
 
         return logits
+
+    def get_global_neuron_parameters(self):
+        lif_nodes = list(self.iter_lif_nodes())
+        if not lif_nodes:
+            return {}
+
+        first_node = lif_nodes[0]
+        params = {
+            "threshold": float(first_node.get_effective_v_threshold().detach().mean().item()),
+        }
+        if self._neuron_adaptation.get("learn_tau", False):
+            params["tau"] = float(first_node.get_tau().detach().mean().item())
+        return params
 
     def get_spike_params(self):
         all_params = []

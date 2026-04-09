@@ -38,9 +38,10 @@ class BrainToTextDataset(Dataset):
          '''
         
         # Set random seed for reproducibility
-        if random_seed != -1:
-            np.random.seed(random_seed)
-            torch.manual_seed(random_seed)
+        if random_seed is not None and int(random_seed) >= 0:
+            self.rng = np.random.default_rng(int(random_seed))
+        else:
+            self.rng = np.random.default_rng()
 
         self.split = split
 
@@ -108,6 +109,7 @@ class BrainToTextDataset(Dataset):
             'n_time_steps' : [],
             'phone_seq_lens' : [],
             'day_indicies' : [],
+            'session_ids' : [],
             'transcriptions' : [],
             'block_nums' : [],
             'trial_nums' : [],
@@ -145,6 +147,7 @@ class BrainToTextDataset(Dataset):
                         batch['n_time_steps'].append(g.attrs['n_time_steps']) # number of time steps in the trial - required since we are padding
                         batch['phone_seq_lens'].append(g.attrs['seq_len']) # number of phonemes in the label - required since we are padding
                         batch['day_indicies'].append(int(d)) # day index of each trial - required for the day specific layers 
+                        batch['session_ids'].append(int(d)) # explicit session id alias for session-adaptive components
                         batch['block_nums'].append(g.attrs['block_num'])
                         batch['trial_nums'].append(g.attrs['trial_num'])
                     
@@ -159,6 +162,7 @@ class BrainToTextDataset(Dataset):
         batch['n_time_steps'] = torch.tensor(batch['n_time_steps']) 
         batch['phone_seq_lens'] = torch.tensor(batch['phone_seq_lens'])
         batch['day_indicies'] = torch.tensor(batch['day_indicies'])
+        batch['session_ids'] = torch.tensor(batch['session_ids'])
         batch['transcriptions'] = torch.stack(batch['transcriptions'])
         batch['block_nums'] = torch.tensor(batch['block_nums'])
         batch['trial_nums'] = torch.tensor(batch['trial_nums'])
@@ -189,11 +193,20 @@ class BrainToTextDataset(Dataset):
             # If must_include_days is not empty, we will use those days and then randomly sample the rest
             if self.must_include_days is not None and len(self.must_include_days) > 0:
 
-                days = np.concatenate((self.must_include_days, np.random.choice(non_must_include_days, size = self.days_per_batch - len(self.must_include_days), replace = False)))
+                days = np.concatenate(
+                    (
+                        self.must_include_days,
+                        self.rng.choice(
+                            non_must_include_days,
+                            size=self.days_per_batch - len(self.must_include_days),
+                            replace=False,
+                        ),
+                    )
+                )
             
             # Otherwise we will select random days without replacement
             else: 
-                days = np.random.choice(list(self.trial_indicies.keys()), size = self.days_per_batch, replace = False)
+                days = self.rng.choice(list(self.trial_indicies.keys()), size=self.days_per_batch, replace=False)
             
             # How many trials will be sampled from each day
             num_trials = math.ceil(self.batch_size / self.days_per_batch) # Use ceiling to make sure we get at least batch_size trials
@@ -201,7 +214,7 @@ class BrainToTextDataset(Dataset):
             for d in days:
 
                 # Trials are sampled with replacement, so if a day has less than (self.batch_size / days_per_batch trials) trials, it won't be a problem
-                trial_idxs = np.random.choice(self.trial_indicies[d]['trials'], size = num_trials, replace = True)
+                trial_idxs = self.rng.choice(self.trial_indicies[d]['trials'], size=num_trials, replace=True)
                 batch[d] = trial_idxs
 
             # Remove extra trials
@@ -209,7 +222,7 @@ class BrainToTextDataset(Dataset):
 
             # While we still have extra trials, remove the last trial from a random day
             while extra_trials > 0: 
-                d = np.random.choice(days)
+                d = self.rng.choice(days)
                 batch[d] = batch[d][:-1]
                 extra_trials -= 1
 
@@ -269,9 +282,10 @@ def train_test_split_indicies(file_paths, test_percentage = 0.1, seed = -1, bad_
                 ...
             }
     '''
-    # Set seed for reporoducibility
-    if seed != -1:
-        np.random.seed(seed)
+    if seed is not None and int(seed) >= 0:
+        rng = np.random.default_rng(int(seed))
+    else:
+        rng = np.random.default_rng()
 
     # Get trials in each day
     trials_per_day = {}
@@ -329,7 +343,7 @@ def train_test_split_indicies(file_paths, test_percentage = 0.1, seed = -1, bad_
             num_test = max(1, int(num_trials * test_percentage))
             
             # Randomly select indices for testing
-            test_indices = np.random.choice(all_trial_indices, size=num_test, replace=False).tolist()
+            test_indices = rng.choice(all_trial_indices, size=num_test, replace=False).tolist()
             
             # Remaining indices go to training
             train_indices = [idx for idx in all_trial_indices if idx not in test_indices]

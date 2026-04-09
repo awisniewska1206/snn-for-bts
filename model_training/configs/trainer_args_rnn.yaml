@@ -1,9 +1,9 @@
 model:
   n_input_features: 512 # number of input features in the neural data. (2 features per electrode, 256 electrodes)
-  n_units: 256 # number of units per GRU layer (base: 768)
+  n_units: 768 # number of units per GRU layer (base: 768)
   rnn_dropout: 0.4 # dropout rate for the GRU layers
   rnn_trainable: true # whether the GRU layers are trainable
-  n_layers: 2 # number of GRU layers (base: 5)
+  n_layers: 5 # number of GRU layers (base: 5)
   patch_size: 14 # size of the input patches (14 time steps)
   patch_stride: 4 # stride for the input patches (4 time steps)
 
@@ -29,15 +29,15 @@ save_val_metrics: true # whether to save validation metrics during training
 early_stopping: false # whether to use early stopping based on validation metrics
 early_stopping_val_steps: 20 # number of validation steps to wait before stopping training if no improvement is seen
 
-num_training_batches: 16000 # number of training batches to run
+num_training_batches: 60000 # number of training batches to run
 lr_scheduler_type: cosine # type of learning rate scheduler to use
 lr_max: 0.005 # maximum learning rate for the main model
 lr_min: 0.0001 # minimum learning rate for the main model
-lr_decay_steps: 16000 # number of steps for the learning rate decay
+lr_decay_steps: 60000 # number of steps for the learning rate decay
 lr_warmup_steps: 1000 # number of warmup steps for the learning rate scheduler
 lr_max_day: 0.005 # maximum learning rate for the day specific input layers
 lr_min_day: 0.0001 # minimum learning rate for the day specific input layers
-lr_decay_steps_day: 16000 # number of steps for the learning rate decay for the day specific input layers
+lr_decay_steps_day: 60000 # number of steps for the learning rate decay for the day specific input layers
 lr_warmup_steps_day: 1000 # number of warmup steps for the learning rate scheduler for the day specific input layers
 
 beta0: 0.9 # beta0 parameter for the Adam optimizer
@@ -57,6 +57,13 @@ log_val_skip_logs: false # whether to skip logging validation metrics
 save_val_logits: true # whether to save validation logits
 save_val_data: false # whether to save validation data
 
+phoneme_transition_bias:
+  enabled: false
+  mode: low_rank # options: low_rank, full
+  rank: 8
+  coefficient: 0.05
+  detach_prev: true
+
 dataset:
   data_transforms:
     white_noise_std: 1.0 # standard deviation of the white noise added to the data
@@ -74,7 +81,6 @@ dataset:
   n_classes: 41 # number of classes (phonemes) in the dataset
   max_seq_elements: 500 # maximum number of sequence elements (phonemes) for any trial
   days_per_batch: 10 # number of randomly-selected days to include in each batch
-  seed: 1 # random seed for reproducibility
   num_dataloader_workers: 4 # number of workers for the data loader
   loader_shuffle: false # whether to shuffle the data loader
   must_include_days: null # specific days to include in the dataset

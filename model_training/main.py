@@ -10,6 +10,7 @@ import torch
 from omegaconf import OmegaConf
 
 from trainer import BrainToTextDecoder_Trainer
+from utils.seeding import set_global_seed
 
 
 def ensure_dir(path: str):
@@ -64,10 +65,11 @@ def remove_dir_with_retry(path: str, retries: int = 5, delay: float = 1.0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["rnn", "snn"], required=True)
+    parser.add_argument("--model", choices=["rnn", "snn", "mlp", "lstm"], required=True)
     parser.add_argument("--trainer_config", required=True)
     parser.add_argument("--snn_config", default=None)
     parser.add_argument("--gpu", default="0")
+    parser.add_argument("--seed", type=int, default=None, help="Optional override for the run seed.")
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--tag", default="", help="Experiment tag/comment to write into the training log")
     parser.add_argument(
@@ -81,21 +83,27 @@ def main():
         cleanup_tmp_root()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args_cli.gpu
-    if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
     trainer_cfg = OmegaConf.load(args_cli.trainer_config)
     trainer_cfg.mode = "train"
     trainer_cfg.gpu_number = args_cli.gpu
     trainer_cfg.model_type = args_cli.model
     trainer_cfg.tag = args_cli.tag
+    if args_cli.seed is not None:
+        trainer_cfg.seed = int(args_cli.seed)
 
     snn_cfg = None
     if args_cli.model == "snn":
         if args_cli.snn_config is None:
             raise ValueError("--snn_config is required when --model snn")
         snn_cfg = OmegaConf.load(args_cli.snn_config)
+        snn_cfg.seed = int(trainer_cfg.seed)
         trainer_cfg.snn_config = snn_cfg
+
+    run_seed = set_global_seed(int(trainer_cfg.seed))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     suffix = args_cli.run_name if args_cli.run_name else args_cli.model
@@ -132,6 +140,7 @@ def main():
         "timestamp": ts,
         "model": args_cli.model,
         "gpu": args_cli.gpu,
+        "seed": run_seed,
         "trainer_config": args_cli.trainer_config,
         "snn_config": args_cli.snn_config,
         "tag": args_cli.tag,

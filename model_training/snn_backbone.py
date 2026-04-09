@@ -5,6 +5,7 @@ import torch.nn as nn
 from spikingjelly.activation_based import functional as sj_functional
 
 from snn_modules_alternative_core import SpikingNeuralNet
+from models.phoneme_transition_bias import build_phoneme_transition_bias
 
 class SpikingModel(nn.Module):
     """
@@ -27,6 +28,8 @@ class SpikingModel(nn.Module):
         debug: bool = False,
         collect_day_stats: bool = False,
         stats_every: int = 1000,
+        session_adaptation_cfg = None,
+        phoneme_transition_bias_cfg = None,
     ):
         super().__init__()
 
@@ -40,6 +43,11 @@ class SpikingModel(nn.Module):
         self.debug = debug
         self.stats_every = stats_every
         self._step = 0
+        self.session_adaptation_cfg = session_adaptation_cfg
+        self.phoneme_transition_bias = build_phoneme_transition_bias(
+            n_classes=n_classes,
+            cfg=phoneme_transition_bias_cfg,
+        )
 
         self.day_layer_activation = nn.Softsign()
         self.day_weights = nn.ParameterList(
@@ -57,8 +65,6 @@ class SpikingModel(nn.Module):
 
         if self.patch_size > 0:
             patched_input_size = int(self.neural_dim * self.patch_size)
-            if "multi_scale_snn" in backbone_cfg.model.setup:
-                backbone_cfg.model.setup.multi_scale_snn.input_size = patched_input_size
 
         self.backbone = SpikingNeuralNet(backbone_cfg)
 
@@ -85,7 +91,7 @@ class SpikingModel(nn.Module):
         x = x_unfold.reshape(x.size(0), x_unfold.size(1), -1)
         return x
 
-    def forward(self, x, day_idx):
+    def forward(self, x, day_idx, session_summary=None):
         """
         x: [B, T, neural_dim]
         returns: [B, T', n_classes]
@@ -102,6 +108,8 @@ class SpikingModel(nn.Module):
         x = x.permute(1, 0, 2).contiguous()   # [T,B,C]
         logits = self.backbone(x)             # [T,B,Cout]
         logits = logits.permute(1, 0, 2).contiguous()
+        if self.phoneme_transition_bias is not None:
+            logits = self.phoneme_transition_bias(logits)
 
         return logits
 
@@ -151,3 +159,8 @@ class SpikingModel(nn.Module):
         if not hasattr(self.backbone, "clear_inference_lag_masks"):
             return
         self.backbone.clear_inference_lag_masks()
+
+    def get_global_neuron_parameters(self):
+        if not hasattr(self.backbone, "get_global_neuron_parameters"):
+            return {}
+        return self.backbone.get_global_neuron_parameters()

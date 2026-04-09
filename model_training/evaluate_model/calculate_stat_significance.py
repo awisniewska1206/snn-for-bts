@@ -1,6 +1,16 @@
+import os
 import re
+import sys
+
 import numpy as np
 from scipy.stats import wilcoxon, ttest_rel
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_TRAINING_DIR = os.path.dirname(SCRIPT_DIR)
+if MODEL_TRAINING_DIR not in sys.path:
+    sys.path.insert(0, MODEL_TRAINING_DIR)
+
+from utils.seeding import set_global_seed
 
 BASE_PATH = "./logs"  # adjust if needed
 
@@ -19,7 +29,7 @@ def load_per(path):
     return per_dict
 
 
-def compare_runs(snn_id, rnn_id):
+def compare_runs(snn_id, rnn_id, seed=0):
     snn_path = f"{BASE_PATH}/snn/{snn_id}/training_log"
     rnn_path = f"{BASE_PATH}/rnn/{rnn_id}/training_log"
 
@@ -47,7 +57,8 @@ def compare_runs(snn_id, rnn_id):
     print(f"Paired t-test p-value: {t_p:.6f}")
 
     # bootstrap CI
-    rng = np.random.default_rng(0)
+    set_global_seed(seed)
+    rng = np.random.default_rng(seed)
     boots = []
     for _ in range(10000):
         idx = rng.integers(0, len(diff), len(diff))

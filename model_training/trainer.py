@@ -1,7 +1,6 @@
 import torch 
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
-import random
 import time
 import os
 import numpy as np
@@ -12,11 +11,13 @@ import sys
 import json
 import yaml
 from collections import defaultdict
+import h5py
 from snn_backbone import SpikingModel
 import pickle
 
 from helpers.dataset import BrainToTextDataset, train_test_split_indicies
 from helpers.data_augmentations import gauss_smooth
+from utils.seeding import make_dataloader_generator, seed_worker, set_global_seed
 
 import torchaudio.functional as F # for edit distance
 from omegaconf import OmegaConf
@@ -24,10 +25,11 @@ from helpers.evaluate_model_helpers import LOGIT_TO_PHONEME, _extract_transcript
 
 
 torch.set_float32_matmul_precision('high') # makes float32 matmuls faster on some GPUs
-torch.backends.cudnn.deterministic = True # makes training more reproducible
 torch._dynamo.config.cache_size_limit = 64
 
 from models.rnn_model import GRUDecoder
+from models.mlp_model import MLPDecoder
+from models.lstm_model import LSTMDecoder
 
 class BrainToTextDecoder_Trainer:
     """
@@ -63,6 +65,7 @@ class BrainToTextDecoder_Trainer:
         self.spiking_batch_stats_path = None
         self.spiking_epoch_stats_path = None
         self.spiking_summary_path = None
+        self.session_threshold_stats_path = None
         self.delay_stats_dir = None
         self.delay_stats_manifest_path = None
         self.lag_selection_dir = None
@@ -70,6 +73,17 @@ class BrainToTextDecoder_Trainer:
         self._validation_run_index = 0
         self._epoch_stat_accumulator = defaultdict(lambda: defaultdict(list))
         self._active_epoch_index = None
+        self.session_summary_by_id = {}
+        session_adapter_cfg = self.args.get("session_adaptation")
+        if session_adapter_cfg is None:
+            session_adapter_cfg = self.args.get("session_threshold_adapter", {})
+        phoneme_transition_bias_cfg = self.args.get("phoneme_transition_bias", {})
+        self.adaptation_mode = session_adapter_cfg.get("adaptation_mode", "day")
+        self.session_threshold_adapter_enabled = self.adaptation_mode == "session_threshold"
+        self.freeze_adapter_batch = session_adapter_cfg.get("freeze_adapter_batch", None)
+        self._session_adapter_frozen = False
+        self.seed = int(self.args.get("seed", 0))
+        set_global_seed(self.seed)
 
         # Create output directory
         if args['mode'] == 'train':
@@ -79,6 +93,10 @@ class BrainToTextDecoder_Trainer:
             self.spiking_batch_stats_path = os.path.join(self.spiking_stats_dir, 'per_batch.jsonl')
             self.spiking_epoch_stats_path = os.path.join(self.spiking_stats_dir, 'per_epoch.jsonl')
             self.spiking_summary_path = os.path.join(self.spiking_stats_dir, 'summary.json')
+            self.session_threshold_stats_path = os.path.join(
+                self.spiking_stats_dir,
+                'session_threshold_adapter.jsonl',
+            )
             self.delay_stats_dir = os.path.join(self.spiking_stats_dir, 'delay_dynamics')
             os.makedirs(self.delay_stats_dir, exist_ok=True)
             self.delay_stats_manifest_path = os.path.join(self.delay_stats_dir, 'manifest.jsonl')
@@ -143,13 +161,6 @@ class BrainToTextDecoder_Trainer:
 
         self.logger.info(f'Using device: {self.device}')
 
-        # Set seed if provided 
-        if self.args['seed'] != -1:
-            np.random.seed(self.args['seed'])
-            random.seed(self.args['seed'])
-            torch.manual_seed(self.args['seed'])
-
-     
         # Initialize the model
         if self.args["model_type"] == "rnn":
             self.model = GRUDecoder(
@@ -162,8 +173,39 @@ class BrainToTextDecoder_Trainer:
                 n_layers=self.args["model"]["n_layers"],
                 patch_size=self.args["model"]["patch_size"],
                 patch_stride=self.args["model"]["patch_stride"],
+                phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
             )
             self.logger.info("Initialized RNN decoding model")
+
+        elif self.args["model_type"] == "mlp":
+            self.model = MLPDecoder(
+                neural_dim=self.args["model"]["n_input_features"],
+                n_units=self.args["model"].get("mlp_hidden_dim", self.args["model"].get("n_units", 0)),
+                n_days=len(self.args["dataset"]["sessions"]),
+                n_classes=self.args["dataset"]["n_classes"],
+                rnn_dropout=self.args["model"]["rnn_dropout"],
+                input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
+                n_layers=self.args["model"]["n_layers"],
+                patch_size=self.args["model"]["patch_size"],
+                patch_stride=self.args["model"]["patch_stride"],
+                phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
+            )
+            self.logger.info("Initialized MLP decoding model")
+
+        elif self.args["model_type"] == "lstm":
+            self.model = LSTMDecoder(
+                neural_dim=self.args["model"]["n_input_features"],
+                n_units=self.args["model"].get("lstm_hidden_dim", self.args["model"].get("n_units", 0)),
+                n_days=len(self.args["dataset"]["sessions"]),
+                n_classes=self.args["dataset"]["n_classes"],
+                rnn_dropout=self.args["model"]["rnn_dropout"],
+                input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
+                n_layers=self.args["model"]["n_layers"],
+                patch_size=self.args["model"]["patch_size"],
+                patch_stride=self.args["model"]["patch_stride"],
+                phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
+            )
+            self.logger.info("Initialized LSTM decoding model")
 
         elif self.args["model_type"] == "snn":
             if "snn_config" not in self.args or self.args["snn_config"] is None:
@@ -180,6 +222,8 @@ class BrainToTextDecoder_Trainer:
                 patch_size=self.args["model"]["patch_size"],
                 patch_stride=self.args["model"]["patch_stride"],
                 debug=False,
+                session_adaptation_cfg=session_adapter_cfg,
+                phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
             )
             self.logger.info("Initialized SNN decoding model")
             lag_selection_paths = self._save_lag_selection_exports()
@@ -204,11 +248,16 @@ class BrainToTextDecoder_Trainer:
         self.logger.info(f"Model has {total_params:,} parameters")
 
         day_params = 0
+        adapter_params = 0
         for name, param in self.model.named_parameters():
             if 'day' in name:
                 day_params += param.numel()
+            if 'low_rank_adapter' in name:
+                adapter_params += param.numel()
         
         self.logger.info(f"Model has {day_params:,} day-specific parameters | {((day_params / total_params) * 100):.2f}% of total parameters")
+        self.logger.info(f"Model has {adapter_params:,} low-rank adapter parameters | {((adapter_params / total_params) * 100):.2f}% of total parameters")
+        self.logger.info(f"Adaptation mode: {self.adaptation_mode}")
 
         # Create datasets and dataloaders
         train_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_train.hdf5') for s in self.args['dataset']['sessions']]
@@ -224,13 +273,13 @@ class BrainToTextDecoder_Trainer:
         train_trials, _ = train_test_split_indicies(
             file_paths = train_file_paths, 
             test_percentage = 0,
-            seed = self.args['dataset']['seed'],
+            seed = self.seed,
             bad_trials_dict = None,
             )
         _, val_trials = train_test_split_indicies(
             file_paths = val_file_paths, 
             test_percentage = 1,
-            seed = self.args['dataset']['seed'],
+            seed = self.seed,
             bad_trials_dict = None,
             )
 
@@ -252,7 +301,7 @@ class BrainToTextDecoder_Trainer:
             n_batches = self.args['num_training_batches'],
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
-            random_seed = self.args['dataset']['seed'],
+            random_seed = self.seed,
             feature_subset = feature_subset
             )
 
@@ -261,7 +310,9 @@ class BrainToTextDecoder_Trainer:
             batch_size = None, # Dataset.__getitem__() already returns batches
             shuffle = self.args['dataset']['loader_shuffle'],
             num_workers = self.args['dataset']['num_dataloader_workers'],
-            pin_memory = True
+            pin_memory = True,
+            worker_init_fn = seed_worker,
+            generator = make_dataloader_generator(self.seed),
         )
 
         # val dataset and dataloader
@@ -272,7 +323,7 @@ class BrainToTextDecoder_Trainer:
             n_batches = None,
             batch_size = self.args['dataset']['batch_size'],
             must_include_days = None,
-            random_seed = self.args['dataset']['seed'],
+            random_seed = self.seed,
             feature_subset = feature_subset   
             )
 
@@ -281,10 +332,13 @@ class BrainToTextDecoder_Trainer:
             batch_size = None, # Dataset.__getitem__() already returns batches
             shuffle = False, 
             num_workers = 0,
-            pin_memory = True 
+            pin_memory = True,
+            worker_init_fn = seed_worker,
+            generator = make_dataloader_generator(self.seed),
         )
 
         self.logger.info("Successfully initialized datasets")
+        self._initialize_session_summaries(train_trials)
 
         # Create optimizer, learning rate scheduler, and loss
         self.optimizer = self.create_optimizer()
@@ -310,7 +364,7 @@ class BrainToTextDecoder_Trainer:
 
         # Set rnn and/or input layers to not trainable if specified 
         for name, param in self.model.named_parameters():
-            if not self.args['model']['rnn_trainable'] and 'gru' in name:
+            if not self.args['model']['rnn_trainable'] and ('gru' in name or 'mlp' in name or 'lstm' in name):
                 param.requires_grad = False
 
             elif not self.args['model']['input_network']['input_trainable'] and 'day' in name:
@@ -352,6 +406,11 @@ class BrainToTextDecoder_Trainer:
             return value.detach().cpu().tolist()
         return value
 
+    def _forward_model(self, features, day_indicies, session_summaries=None):
+        if self.args.get("model_type") == "snn":
+            return self.model(features, day_indicies, session_summary=session_summaries)
+        return self.model(features, day_indicies)
+
     def _record_epoch_layer_stats(self, layer_name, layer_stats):
         for metric_name, metric_value in layer_stats.items():
             if metric_value is None:
@@ -381,6 +440,12 @@ class BrainToTextDecoder_Trainer:
             "layers": epoch_layers,
         }
 
+        global_neuron_params = self._log_global_neuron_parameters(
+            prefix=f"Epoch {int(epoch_index)}",
+        )
+        if global_neuron_params:
+            epoch_record["global_neuron_parameters"] = global_neuron_params
+
         with open(self.spiking_epoch_stats_path, "a") as f:
             f.write(json.dumps(self._to_serializable(epoch_record)) + "\n")
 
@@ -388,6 +453,25 @@ class BrainToTextDecoder_Trainer:
             json.dump(self._to_serializable(epoch_record), f, indent=2)
 
         self._epoch_stat_accumulator = defaultdict(lambda: defaultdict(list))
+
+    def _log_global_neuron_parameters(self, prefix):
+        if self.args.get("model_type") != "snn":
+            return {}
+        if not hasattr(self.model, "get_global_neuron_parameters"):
+            return {}
+
+        global_neuron_params = self.model.get_global_neuron_parameters() or {}
+        if not global_neuron_params:
+            return {}
+
+        log_line = (
+            f"{prefix} global neuron threshold="
+            f"{float(global_neuron_params['threshold']):.6f}"
+        )
+        if "tau" in global_neuron_params:
+            log_line += f" tau={float(global_neuron_params['tau']):.6f}"
+        self.logger.info(log_line)
+        return global_neuron_params
 
     def _save_spiking_batch_stats(self, batch_index, epoch_index):
         if self.args.get("model_type") != "snn":
@@ -417,6 +501,146 @@ class BrainToTextDecoder_Trainer:
 
         with open(self.spiking_batch_stats_path, "a") as f:
             f.write(json.dumps(self._to_serializable(batch_record)) + "\n")
+
+    def _initialize_session_summaries(self, trial_indicies):
+        if not self.session_threshold_adapter_enabled:
+            return
+
+        feature_subset = self.args["dataset"].get("feature_subset")
+        summary_by_id = {}
+
+        for session_id, session_info in trial_indicies.items():
+            total_sum = None
+            total_sq_sum = None
+            total_count = 0
+
+            with h5py.File(session_info["session_path"], "r") as handle:
+                for trial_idx in session_info["trials"]:
+                    trial_group = handle[f"trial_{trial_idx:04d}"]
+                    input_features = trial_group["input_features"][:]
+                    if feature_subset is not None:
+                        input_features = input_features[:, feature_subset]
+
+                    input_features = input_features.astype(np.float64, copy=False)
+                    if total_sum is None:
+                        n_channels = int(input_features.shape[1])
+                        total_sum = np.zeros(n_channels, dtype=np.float64)
+                        total_sq_sum = np.zeros(n_channels, dtype=np.float64)
+
+                    total_sum += input_features.sum(axis=0)
+                    total_sq_sum += np.square(input_features).sum(axis=0)
+                    total_count += int(input_features.shape[0])
+
+            if total_sum is None or total_count <= 0:
+                raise ValueError(f"No usable input_features found for session_id={session_id}")
+
+            mean = total_sum / total_count
+            var = np.maximum((total_sq_sum / total_count) - np.square(mean), 0.0)
+            std = np.sqrt(var)
+            summary = np.concatenate([mean, std], axis=0).astype(np.float32, copy=False)
+            summary_by_id[int(session_id)] = torch.from_numpy(summary)
+
+        self.session_summary_by_id = summary_by_id
+        summary_dim = next(iter(summary_by_id.values())).numel() if summary_by_id else 0
+        self.logger.info(
+            f"Initialized {len(self.session_summary_by_id)} fixed session summaries for threshold adaptation "
+            f"(summary_dim={summary_dim})"
+        )
+
+    def _lookup_session_summaries(self, session_ids):
+        if not self.session_threshold_adapter_enabled:
+            return None
+
+        summaries = []
+        missing = []
+        for session_id in session_ids.detach().cpu().tolist():
+            summary = self.session_summary_by_id.get(int(session_id))
+            if summary is None:
+                missing.append(int(session_id))
+                continue
+            summaries.append(summary)
+
+        if missing:
+            raise KeyError(f"Missing session summaries for session_ids={sorted(set(missing))}")
+
+        return torch.stack(summaries, dim=0).to(self.device)
+
+    def _save_session_threshold_batch_stats(self, epoch_index, batch_index):
+        if not self.session_threshold_adapter_enabled:
+            return
+        if batch_index is None:
+            return
+        if not hasattr(self.model, "compute_session_adaptation"):
+            return
+        if not self.session_summary_by_id:
+            return
+
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            for session_id in sorted(self.session_summary_by_id.keys()):
+                session_summary = self.session_summary_by_id[session_id].unsqueeze(0).to(self.device)
+                delta_v_th, delta_gain = self.model.compute_session_adaptation(session_summary)
+                if delta_v_th is None or delta_gain is None:
+                    continue
+                delta_v_th = delta_v_th.detach().float()
+                delta_gain = delta_gain.detach().float()
+                record = {
+                    "session_id": int(session_id),
+                    "epoch": None if epoch_index is None else int(epoch_index),
+                    "batch": int(batch_index),
+                    "delta_v_th_mean": float(delta_v_th.mean().item()),
+                    "delta_v_th_std": float(delta_v_th.std(unbiased=False).item()),
+                    "delta_gain_mean": float(delta_gain.mean().item()),
+                    "delta_gain_std": float(delta_gain.std(unbiased=False).item()),
+                }
+                if self.session_threshold_stats_path is not None:
+                    with open(self.session_threshold_stats_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+        if was_training:
+            self.model.train()
+
+    def _maybe_freeze_session_adapter(self, current_batch):
+        if not self.session_threshold_adapter_enabled:
+            return
+        if self._session_adapter_frozen:
+            return
+        if self.freeze_adapter_batch is None:
+            return
+        if current_batch < int(self.freeze_adapter_batch):
+            return
+        if not hasattr(self.model, "freeze_session_adapter"):
+            return
+        did_freeze = self.model.freeze_session_adapter()
+        if not did_freeze:
+            return
+        self._session_adapter_frozen = True
+        self.logger.info(
+            f"Freezing SessionThresholdAdapter at batch {int(current_batch)} "
+            f"(freeze_adapter_batch={int(self.freeze_adapter_batch)})"
+        )
+
+    def _verify_optimizer_parameter_consistency(self):
+        if self.optimizer is None:
+            return
+
+        model_params = {id(param): name for name, param in self.model.named_parameters()}
+        stale_refs = []
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            for param_idx, param in enumerate(group["params"]):
+                if id(param) not in model_params:
+                    stale_refs.append(
+                        {
+                            "group_idx": int(group_idx),
+                            "param_idx": int(param_idx),
+                        }
+                    )
+
+        if stale_refs:
+            raise RuntimeError(
+                "Optimizer param_groups contain parameter references that are not present in the current model. "
+                f"Found {len(stale_refs)} stale reference(s), sample={stale_refs[:5]}"
+            )
 
     def _save_delay_statistics(self, batch_index, epoch_index, event_name, store_full=True):
         if self.args.get("model_type") != "snn":
@@ -971,11 +1195,13 @@ class BrainToTextDecoder_Trainer:
                 features = batch["input_features"].to(self.device)
                 n_time_steps = batch["n_time_steps"].to(self.device)
                 day_indicies = batch["day_indicies"].to(self.device)
+                session_ids = batch.get("session_ids", batch["day_indicies"]).to(self.device)
 
                 features, n_time_steps = self.transform_data(features, n_time_steps, "val")
                 adjusted_lens = self.compute_output_lengths(n_time_steps)
+                session_summaries = self._lookup_session_summaries(session_ids)
 
-                baseline_logits = self.model(features, day_indicies)
+                baseline_logits = self._forward_model(features, day_indicies, session_summaries)
                 adjusted_lens = torch.clamp(adjusted_lens, max=baseline_logits.shape[1])
 
                 baseline_metrics = {}
@@ -991,7 +1217,7 @@ class BrainToTextDecoder_Trainer:
                 for spec in ablation_specs:
                     condition_idx = spec["condition_index"]
                     self.model.set_inference_lag_mask(block_idx, spec["lag_mask"])
-                    ablated_logits = self.model(features, day_indicies)
+                    ablated_logits = self._forward_model(features, day_indicies, session_summaries)
                     self.model.clear_inference_lag_masks()
 
                     ablated_metrics_by_lag[condition_idx] = {}
@@ -1302,9 +1528,12 @@ class BrainToTextDecoder_Trainer:
     
         Day weights should have a separate learning rate
         '''
-        bias_params = [p for name, p in self.model.named_parameters() if 'gru.bias' in name or 'out.bias' in name]
+        bias_params = [p for name, p in self.model.named_parameters() if name.endswith('.bias')]
         day_params = [p for name, p in self.model.named_parameters() if 'day_' in name]
-        other_params = [p for name, p in self.model.named_parameters() if 'day_' not in name and 'gru.bias' not in name and 'out.bias' not in name]
+        other_params = [p for name, p in self.model.named_parameters() if 'day_' not in name and not name.endswith('.bias')]
+        bias_params = [p for p in bias_params if p.requires_grad]
+        day_params = [p for p in day_params if p.requires_grad]
+        other_params = [p for p in other_params if p.requires_grad]
     
         if len(day_params) != 0:
             param_groups = [
@@ -1434,6 +1663,7 @@ class BrainToTextDecoder_Trainer:
         if checkpoint_parent:
             os.makedirs(checkpoint_parent, exist_ok=True)
         os.makedirs(self.args['checkpoint_dir'], exist_ok=True)
+        self._verify_optimizer_parameter_consistency()
     
         checkpoint = {
             'model_state_dict' : self.model.state_dict(),
@@ -1561,6 +1791,7 @@ class BrainToTextDecoder_Trainer:
 
         for i, batch in enumerate(self.train_loader):
             epoch_index = i // max(1, self.train_batches_per_epoch)
+            self._maybe_freeze_session_adapter(i)
             if self._active_epoch_index is None:
                 self._active_epoch_index = epoch_index
             elif epoch_index != self._active_epoch_index:
@@ -1577,6 +1808,7 @@ class BrainToTextDecoder_Trainer:
             n_time_steps = batch["n_time_steps"].to(self.device)
             phone_seq_lens = batch["phone_seq_lens"].to(self.device)
             day_indicies = batch["day_indicies"].to(self.device)
+            session_ids = batch.get("session_ids", batch["day_indicies"]).to(self.device)
 
             log_stats = (i % 200 == 0)
 
@@ -1589,9 +1821,10 @@ class BrainToTextDecoder_Trainer:
                 features, n_time_steps = self.transform_data(features, n_time_steps, "train")
 
                 adjusted_lens = self.compute_output_lengths(n_time_steps)
+                session_summaries = self._lookup_session_summaries(session_ids)
 
                 # Forward
-                logits = self.model(features, day_indicies)  # [B, T, C]
+                logits = self._forward_model(features, day_indicies, session_summaries)  # [B, T, C]
 
                 # CTC expects input_lengths <= logits time dim
                 T_out = logits.shape[1]
@@ -1655,6 +1888,9 @@ class BrainToTextDecoder_Trainer:
             # Step
             self.optimizer.step()
             self.learning_rate_scheduler.step()
+            self._save_session_threshold_batch_stats(epoch_index=epoch_index, batch_index=i)
+            if i % 2000 == 0:
+                self._log_global_neuron_parameters(prefix=f"Batch {int(i)}")
 
             # Save training metrics
             train_step_duration = time.time() - start_time
@@ -1889,8 +2125,9 @@ class BrainToTextDecoder_Trainer:
                     features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
 
                     adjusted_lens = self.compute_output_lengths(n_time_steps)
+                    session_summaries = self._lookup_session_summaries(session_ids)
 
-                    logits = self.model(features, day_indicies)
+                    logits = self._forward_model(features, day_indicies, session_summaries)
                     
                     # CTC expects input_lengths <= logits time dim
                     T_out = logits.shape[1]

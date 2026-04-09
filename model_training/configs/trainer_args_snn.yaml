@@ -71,7 +71,6 @@ dataset:
   n_classes: 41
   max_seq_elements: 500
   days_per_batch: 2
-  seed: 1
   num_dataloader_workers: 4
   loader_shuffle: false
   must_include_days: null

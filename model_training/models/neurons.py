@@ -8,6 +8,11 @@ import random
 from spikingjelly.activation_based import base
 
 
+def _tau_to_w_value(tau: float) -> float:
+    tau = float(max(tau, 1.0001))
+    return float(torch.logit(torch.tensor(1.0 / tau)).item())
+
+
 def _flatten_samples_and_neurons(x: torch.Tensor):
     if x is None or not isinstance(x, torch.Tensor):
         return None
@@ -67,25 +72,77 @@ class LTLIFNode(neuron.ParametricLIFNode):
 
     def __init__(self, v_threshold=1.0, v_threshold_min=0.1, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.v_threshold = nn.Parameter(torch.tensor(v_threshold))
-        self.v_threshold_min = v_threshold_min
+        self.v_threshold = nn.Parameter(torch.tensor(float(v_threshold)))
+        self.v_threshold_min = float(v_threshold_min)
         self.spike_rate = None
         self.last_forward_stats = {}
+        self._threshold_delta = None
+        self._tau_min = None
+        self._tau_max = None
+        self._w_min = None
+        self._w_max = None
+
+    def set_threshold_delta(self, delta_v_th):
+        self._threshold_delta = delta_v_th
+
+    def clear_threshold_delta(self):
+        self._threshold_delta = None
+
+    def set_tau_bounds(self, tau_min=None, tau_max=None):
+        if tau_min is None or tau_max is None:
+            self._tau_min = None
+            self._tau_max = None
+            self._w_min = None
+            self._w_max = None
+            return
+
+        tau_min = float(max(tau_min, 1.0001))
+        tau_max = float(max(tau_max, tau_min + 1e-6))
+        self._tau_min = tau_min
+        self._tau_max = tau_max
+        self._w_min = _tau_to_w_value(tau_max)
+        self._w_max = _tau_to_w_value(tau_min)
+
+    def get_effective_v_threshold(self):
+        effective_v_th = self.v_threshold
+        if self._threshold_delta is not None:
+            delta_v_th = self._threshold_delta.to(
+                device=self.v_threshold.device,
+                dtype=self.v_threshold.dtype,
+            )
+            effective_v_th = effective_v_th + delta_v_th
+        return torch.clamp(effective_v_th, min=self.v_threshold_min)
+
+    def neuronal_fire(self):
+        return self.surrogate_function(self.v - self.get_effective_v_threshold())
+
+    def neuronal_reset(self, spike):
+        spike_d = spike.detach() if self.detach_reset else spike
+        if self.v_reset is None:
+            self.v = self.v - spike_d * self.get_effective_v_threshold()
+        else:
+            self.v = self.v_reset * spike_d + (1.0 - spike_d) * self.v
+
+    def get_tau(self):
+        return 1.0 / self.w.sigmoid()
 
     def forward(self, x: torch.Tensor):
-        self.v_threshold.data.clamp_(min=self.v_threshold_min)
+        with torch.no_grad():
+            self.v_threshold.clamp_(min=self.v_threshold_min)
+            if self._w_min is not None and self._w_max is not None:
+                self.w.clamp_(min=self._w_min, max=self._w_max)
         spikes_out = super().forward(x)
         self.spike_rate = (spikes_out > 0).float().mean()  # retains gradient, I hope...
         self.last_forward_stats = _compute_spiking_statistics(
             spikes_out=spikes_out,
             membrane=getattr(self, "v", None),
-            threshold=self.v_threshold,
+            threshold=self.get_effective_v_threshold(),
         )
         return spikes_out
 
     def get_spike_params(self):
-        thresh = self.v_threshold.item()
-        tau = (1.0 / self.w.sigmoid()).item()
+        thresh = float(self.get_effective_v_threshold().detach().mean().item())
+        tau = float(self.get_tau().detach().mean().item())
         return np.array([thresh, tau])
 
     def get_explicit_neuron_count(self):

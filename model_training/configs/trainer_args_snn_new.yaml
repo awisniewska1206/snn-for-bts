@@ -26,6 +26,11 @@ save_val_metrics: true
 early_stopping: false
 early_stopping_val_steps: 20
 
+session_adaptation:
+  adaptation_mode: none # options: day, low_rank, none
+  low_rank_rank: 32
+  low_rank_init_scale: 0.001
+
 num_training_batches: 16000
 lr_scheduler_type: cosine
 lr_max: 0.05
@@ -54,6 +59,13 @@ log_val_skip_logs: false
 save_val_logits: true
 save_val_data: false
 
+phoneme_transition_bias:
+  enabled: false
+  mode: low_rank
+  rank: 8
+  coefficient: 0.05
+  detach_prev: true
+
 dataset:
   data_transforms:
     white_noise_std: 1.0
@@ -71,7 +83,6 @@ dataset:
   n_classes: 41
   max_seq_elements: 500
   days_per_batch: 2
-  seed: 1
   num_dataloader_workers: 4
   loader_shuffle: false
   must_include_days: null

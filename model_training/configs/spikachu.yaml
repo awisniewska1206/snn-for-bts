@@ -13,6 +13,10 @@ model:
     input_size: 512
     pre_trained_path: ~
     finetune_with_unit_identification: False
+    neuron_adaptation:
+      enabled: false
+      learn_threshold: false
+      learn_tau: false
 
     multi_scale_snn:
       list_of_taus_ms: [5.0]

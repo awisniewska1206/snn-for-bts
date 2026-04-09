@@ -1,0 +1,10 @@
+{
+  "model_name": "lags_0_7",
+  "checkpoint_dir": "../logs/snn/2026-04-05/2026-04-05_21-56-32_480174_snn_pid559382/checkpoints",
+  "num_samples": 0,
+  "num_frames": 0,
+  "alignment_method_counts": {},
+  "sample_csv": "/home/alex/snn_for_bts/brain_to_text/model_training/evaluate_model/ctc_model_comparison_outputs/lags_0_7/lags_0_7_sample_summary.csv",
+  "frame_csv_gz": "/home/alex/snn_for_bts/brain_to_text/model_training/evaluate_model/ctc_model_comparison_outputs/lags_0_7/lags_0_7_frame_summary.csv.gz",
+  "h5_path": "/home/alex/snn_for_bts/brain_to_text/model_training/evaluate_model/ctc_model_comparison_outputs/lags_0_7/lags_0_7_traces.h5"
+}

@@ -1,5 +1,6 @@
 import torch 
 from torch import nn
+from models.phoneme_transition_bias import build_phoneme_transition_bias
 
 class GRUDecoder(nn.Module):
     '''
@@ -17,6 +18,7 @@ class GRUDecoder(nn.Module):
                  n_layers = 5, 
                  patch_size = 0,
                  patch_stride = 0,
+                 phoneme_transition_bias_cfg = None,
                  ):
         '''
         neural_dim  (int)      - number of channels in a single timestep (e.g. 512)
@@ -42,6 +44,10 @@ class GRUDecoder(nn.Module):
         
         self.patch_size = patch_size
         self.patch_stride = patch_stride
+        self.phoneme_transition_bias = build_phoneme_transition_bias(
+            n_classes=self.n_classes,
+            cfg=phoneme_transition_bias_cfg,
+        )
 
         # Parameters for the day-specific input layers
         self.day_layer_activation = nn.Softsign() # basically a shallower tanh 
@@ -127,6 +133,8 @@ class GRUDecoder(nn.Module):
 
         # Compute logits
         logits = self.out(output)
+        if self.phoneme_transition_bias is not None:
+            logits = self.phoneme_transition_bias(logits)
         
         if return_state:
             return logits, hidden_states

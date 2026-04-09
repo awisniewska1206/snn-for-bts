@@ -311,18 +311,20 @@ for session, data in test_data.items():
         #print(true_seq_phoneme)
         #print(pred_seq_phoneme)
         predictions.append(row)
-        per, edit_distance = phoneme_error_rate(true_seq_phoneme, pred_seq_phoneme)
-        #print(edit_distance)
-        #print(len(true_seq_phoneme))
-        true_seq_length += len(true_seq_phoneme)
-        edit_distance_total += edit_distance
-        #print(per.round(3))
-        print()
+        if eval_type == 'val':
+            per, edit_distance = phoneme_error_rate(true_seq_phoneme, pred_seq_phoneme)
+            #print(edit_distance)
+            #print(len(true_seq_phoneme))
+            true_seq_length += len(true_seq_phoneme)
+            edit_distance_total += edit_distance
+            #print(per.round(3))
+            print()
 
-per_final = edit_distance_total / true_seq_length
-print(f'Total edit distance: {edit_distance_total}')
-print(f'Total true sequence length: {true_seq_length}')
-print(f'Aggregate Phoneme Error Rate (PER): {per_final:.5f}')
+if eval_type == 'val':
+    per_final = edit_distance_total / true_seq_length
+    print(f'Total edit distance: {edit_distance_total}')
+    print(f'Total true sequence length: {true_seq_length}')
+    print(f'Aggregate Phoneme Error Rate (PER): {per_final:.5f}')
 if eval_type == 'val':
     mean_bert_score = float(np.mean(bert_scores)) if len(bert_scores) > 0 else float('nan')
     print(f'Mean semantic BERT score ({bert_score_mode}): {mean_bert_score:.5f}')
@@ -330,7 +332,6 @@ if eval_type == 'val':
 #csv_filename = f'predictions_{eval_type}_2.csv'
 #df.to_csv(csv_filename, index=False)
 
-'''
 # language model inference via redis
 # make sure that the standalone language model is running on the localhost redis ip
 # see README.md for instructions on how to run the language model
@@ -447,4 +448,4 @@ if eval_type == 'val':
 output_file = os.path.join(model_path, f'baseline_rnn_{eval_type}_predicted_sentences_{time.strftime("%Y%m%d_%H%M%S")}.csv')
 ids = [i for i in range(len(lm_results['pred_sentence']))]
 df_out = pd.DataFrame({'id': ids, 'text': lm_results['pred_sentence']})
-df_out.to_csv(output_file, index=False)'''
+df_out.to_csv(output_file, index=False)

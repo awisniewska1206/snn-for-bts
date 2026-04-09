@@ -1,9 +1,7 @@
 import argparse
 import os
-import random
 import sys
 
-import numpy as np
 import torch
 from omegaconf import OmegaConf
 
@@ -13,6 +11,7 @@ if MODEL_TRAINING_DIR not in sys.path:
     sys.path.insert(0, MODEL_TRAINING_DIR)
 
 from trainer import BrainToTextDecoder_Trainer
+from utils.seeding import set_global_seed
 
 
 def main():
@@ -49,11 +48,7 @@ def main():
         "include_only_lag0=True"
     )
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    set_global_seed(args.seed)
 
     if args.gpu == "-1":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -72,7 +67,10 @@ def main():
     trainer_cfg.save_val_logits = False
     trainer_cfg.save_val_data = False
     trainer_cfg.use_amp = False
+    trainer_cfg.seed = int(args.seed)
     trainer_cfg.gpu_number = 0 if args.gpu != "-1" else -1
+    if "snn_config" in trainer_cfg and trainer_cfg.snn_config is not None:
+        trainer_cfg.snn_config.seed = int(args.seed)
 
     if args.output_path:
         output_root = os.path.dirname(args.output_path) or "."
@@ -91,6 +89,7 @@ def main():
 
     if args.snn_config is not None:
         trainer_cfg.snn_config = OmegaConf.load(args.snn_config)
+        trainer_cfg.snn_config.seed = int(args.seed)
         print(f"[lag-ablation] loaded snn_config={args.snn_config}")
 
     print(f"[lag-ablation] output_root={output_root}")
