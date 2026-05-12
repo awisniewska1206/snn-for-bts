@@ -1,0 +1,25 @@
+{
+  "num_gru_trials": 1884,
+  "num_lagged_snn_trials": 1884,
+  "num_no_lag_snn_trials": 1884,
+  "num_shared_trials": 1884,
+  "num_trimmed_length_trials": 1884,
+  "window_radius": 10,
+  "window_size": 21,
+  "candidate_transitions": 48944,
+  "used_transitions": 47946,
+  "skipped_edge_transitions": 998,
+  "frame_step_seconds": 0.02,
+  "files_read": {
+    "gru_reference": "/home/alex/snn_for_bts/brain_to_text/model_training/logs/rnn_final/2026-04-11_08-15-05_844366_rnn_pid398260/checkpoints/daywise_test_split_04_validation_export.pt",
+    "lagged_snn": "/home/alex/snn_for_bts/brain_to_text/model_training/logs/snn_final/2026-04-13_12-38-31_420690_snn_pid89558/checkpoints/daywise_test_split_04_validation_export.pt",
+    "no_lag_snn": "/home/alex/snn_for_bts/brain_to_text/model_training/logs/snn_lags_ablation1/2026-04-14_11-31-15_714173_snn_pid2420/checkpoints/daywise_test_split_04_validation_export.pt"
+  },
+  "figure_path": "/home/alex/snn_for_bts/brain_to_text/analyses/figures/lag_vs_nolag_boundary_analysis.png",
+  "figure_layout": "two-column separate lag vs no-delay panels",
+  "resolved_exports": {
+    "gru_reference": "/home/alex/snn_for_bts/brain_to_text/model_training/logs/rnn_final/2026-04-11_08-15-05_844366_rnn_pid398260/checkpoints/daywise_test_split_04_validation_export.pt",
+    "lagged_snn": "/home/alex/snn_for_bts/brain_to_text/model_training/logs/snn_final/2026-04-13_12-38-31_420690_snn_pid89558/checkpoints/daywise_test_split_04_validation_export.pt",
+    "no_lag_snn": "/home/alex/snn_for_bts/brain_to_text/model_training/logs/snn_lags_ablation1/2026-04-14_11-31-15_714173_snn_pid2420/checkpoints/daywise_test_split_04_validation_export.pt"
+  }
+}

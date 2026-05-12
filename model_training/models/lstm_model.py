@@ -13,25 +13,30 @@ class LSTMDecoder(nn.Module):
     def __init__(
         self,
         neural_dim,
-        n_units,
+        hidden_size,
         n_days,
         n_classes,
-        rnn_dropout=0.0,
+        dropout=0.0,
         input_dropout=0.0,
         n_layers=5,
         patch_size=0,
         patch_stride=0,
         phoneme_transition_bias_cfg=None,
+        rnn_dropout=None,
     ):
         super().__init__()
 
+        if rnn_dropout is not None:
+            dropout = rnn_dropout
+
         self.neural_dim = neural_dim
-        self.n_units = n_units
+        self.hidden_size = int(hidden_size)
         self.n_classes = n_classes
         self.n_layers = n_layers
         self.n_days = n_days
 
-        self.rnn_dropout = rnn_dropout
+        self.dropout = float(dropout)
+        self.rnn_dropout = self.dropout
         self.input_dropout = input_dropout
 
         self.patch_size = patch_size
@@ -57,9 +62,9 @@ class LSTMDecoder(nn.Module):
 
         self.lstm = nn.LSTM(
             input_size=self.input_size,
-            hidden_size=self.n_units,
+            hidden_size=self.hidden_size,
             num_layers=self.n_layers,
-            dropout=self.rnn_dropout,
+            dropout=self.dropout,
             batch_first=True,
             bidirectional=False,
         )
@@ -70,11 +75,11 @@ class LSTMDecoder(nn.Module):
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
 
-        self.out = nn.Linear(self.n_units, self.n_classes)
+        self.out = nn.Linear(self.hidden_size, self.n_classes)
         nn.init.xavier_uniform_(self.out.weight)
 
-        self.h0 = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, 1, self.n_units)))
-        self.c0 = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, 1, self.n_units)))
+        self.h0 = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, 1, self.hidden_size)))
+        self.c0 = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, 1, self.hidden_size)))
 
     def _apply_day_specific_input(self, x, day_idx):
         day_weights = torch.stack([self.day_weights[i] for i in day_idx], dim=0)
@@ -113,8 +118,8 @@ class LSTMDecoder(nn.Module):
         x = self._patch_inputs(x)
 
         if states is None:
-            h0 = self.h0.expand(self.n_layers, x.shape[0], self.n_units).contiguous()
-            c0 = self.c0.expand(self.n_layers, x.shape[0], self.n_units).contiguous()
+            h0 = self.h0.expand(self.n_layers, x.shape[0], self.hidden_size).contiguous()
+            c0 = self.c0.expand(self.n_layers, x.shape[0], self.hidden_size).contiguous()
             states = (h0, c0)
 
         output, hidden_states = self.lstm(x, states)

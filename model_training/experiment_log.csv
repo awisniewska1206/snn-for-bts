@@ -1,9 +1,0 @@
-model_family,size_config,seed,tag,status
-mlp,small,0,mlp_small_seed0,success
-mlp,small,1,mlp_small_seed1,success
-mlp,small,2,mlp_small_seed2,success
-mlp,small,3,mlp_small_seed3,success
-mlp,small,4,mlp_small_seed4,success
-mlp,medium,0,mlp_medium_seed0,success
-mlp,medium,1,mlp_medium_seed1,success
-mlp,medium,2,mlp_medium_seed2,success

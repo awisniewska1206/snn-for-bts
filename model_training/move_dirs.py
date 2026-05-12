@@ -11,9 +11,8 @@ for item in log_dir.iterdir():
     target_dir = log_dir / date
     target_dir.mkdir(exist_ok=True)
 
-    # Only move if item is not already in a date-organized subdirectory
     if item.parent == log_dir:
         dest = target_dir / item.name
-        if item != target_dir:  # Avoid moving dir to itself
+        if item != target_dir:
             print(f"Moving {item.name} to {target_dir}")
             shutil.move(str(item), str(dest))

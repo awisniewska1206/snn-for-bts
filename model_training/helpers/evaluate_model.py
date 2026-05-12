@@ -21,8 +21,8 @@ MODEL_TRAINING_ROOT = Path(__file__).resolve().parents[1]
 if str(MODEL_TRAINING_ROOT) not in sys.path:
     sys.path.insert(0, str(MODEL_TRAINING_ROOT))
 
-from models.rnn_model import GRUDecoder
-from snn_backbone import SpikingModel
+from model_training.models.gru_model import GRUDecoder
+from model_training.models.snn_backbone import SpikingModel
 from helpers.evaluate_model_helpers import *
 
 _BERT_SCORE_FN = None
@@ -131,6 +131,7 @@ elif model_args["model_type"] == "snn":
         patch_size = model_args["model"]["patch_size"],
         patch_stride = model_args["model"]["patch_stride"],
         debug = False,
+        day_adaptation_mode = model_args.get("day_adaptation_mode", "matrix"),
     )
 else:
     raise ValueError(f"Unknown model_type: {model_args['model_type']}")

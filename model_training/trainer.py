@@ -12,11 +12,16 @@ import json
 import yaml
 from collections import defaultdict
 import h5py
-from snn_backbone import SpikingModel
+from model_training.models.snn_backbone import SpikingModel
 import pickle
 
-from helpers.dataset import BrainToTextDataset, train_test_split_indicies
+from helpers.dataset import (
+    BrainToTextDataset,
+    load_trial_indices_from_split_csv,
+    train_test_split_indicies,
+)
 from helpers.data_augmentations import gauss_smooth
+from utils.model_config import canonicalize_model_type, ensure_model_config_schema
 from utils.seeding import make_dataloader_generator, seed_worker, set_global_seed
 
 import torchaudio.functional as F # for edit distance
@@ -27,9 +32,10 @@ from helpers.evaluate_model_helpers import LOGIT_TO_PHONEME, _extract_transcript
 torch.set_float32_matmul_precision('high') # makes float32 matmuls faster on some GPUs
 torch._dynamo.config.cache_size_limit = 64
 
-from models.rnn_model import GRUDecoder
+from models.gru_model import GRUDecoder
 from models.mlp_model import MLPDecoder
 from models.lstm_model import LSTMDecoder
+from models.tcn_model import TCNDecoder
 
 class BrainToTextDecoder_Trainer:
     """
@@ -45,6 +51,8 @@ class BrainToTextDecoder_Trainer:
 
         # Trainer fields
         self.args = args
+        self.args["model_type"] = canonicalize_model_type(self.args.get("model_type"))
+        ensure_model_config_schema(self.args["model"])
         self.logger = None 
         self.device = None
         self.model = None
@@ -69,8 +77,11 @@ class BrainToTextDecoder_Trainer:
         self.delay_stats_dir = None
         self.delay_stats_manifest_path = None
         self.lag_selection_dir = None
+        self.delay_parameter_csv_path = None
+        self.delay_parameter_export_interval = int(self.args.get("delay_parameter_export_interval", 6000))
         self.ctc_evidence_dir = None
         self._validation_run_index = 0
+        self._validation_observers = []
         self._epoch_stat_accumulator = defaultdict(lambda: defaultdict(list))
         self._active_epoch_index = None
         self.session_summary_by_id = {}
@@ -102,6 +113,10 @@ class BrainToTextDecoder_Trainer:
             self.delay_stats_manifest_path = os.path.join(self.delay_stats_dir, 'manifest.jsonl')
             self.lag_selection_dir = os.path.join(self.args['output_dir'], 'lag_selections')
             os.makedirs(self.lag_selection_dir, exist_ok=True)
+            self.delay_parameter_csv_path = os.path.join(
+                self.args['output_dir'],
+                'learned_delay_checkpoints.csv',
+            )
 
         # Create checkpoint directory
         if args['save_best_checkpoint'] or args['save_all_val_steps'] or args['save_final_model']: 
@@ -117,6 +132,7 @@ class BrainToTextDecoder_Trainer:
         for handler in self.logger.handlers[:]:  # make a copy of the list
             self.logger.removeHandler(handler)
         self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
         formatter = logging.Formatter(fmt='%(asctime)s: %(message)s')        
 
         if args['mode']=='train':
@@ -162,52 +178,95 @@ class BrainToTextDecoder_Trainer:
         self.logger.info(f'Using device: {self.device}')
 
         # Initialize the model
-        if self.args["model_type"] == "rnn":
+        model_type = self.args["model_type"]
+        model_cfg = self.args["model"]
+        input_dropout = float(model_cfg["input_network"].get("input_layer_dropout", 0.0))
+
+        if model_type == "gru":
             self.model = GRUDecoder(
-                neural_dim=self.args["model"]["n_input_features"],
-                n_units=self.args["model"]["n_units"],
+                neural_dim=model_cfg["n_input_features"],
+                hidden_size=int(model_cfg["hidden_size"]),
                 n_days=len(self.args["dataset"]["sessions"]),
                 n_classes=self.args["dataset"]["n_classes"],
-                rnn_dropout=self.args["model"]["rnn_dropout"],
-                input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
-                n_layers=self.args["model"]["n_layers"],
-                patch_size=self.args["model"]["patch_size"],
-                patch_stride=self.args["model"]["patch_stride"],
+                dropout=float(model_cfg.get("dropout", 0.0)),
+                input_dropout=input_dropout,
+                n_layers=model_cfg["n_layers"],
+                patch_size=model_cfg["patch_size"],
+                patch_stride=model_cfg["patch_stride"],
                 phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
             )
-            self.logger.info("Initialized RNN decoding model")
+            self.logger.info("Initialized GRU decoding model")
 
-        elif self.args["model_type"] == "mlp":
+        elif model_type == "mlp":
             self.model = MLPDecoder(
-                neural_dim=self.args["model"]["n_input_features"],
-                n_units=self.args["model"].get("mlp_hidden_dim", self.args["model"].get("n_units", 0)),
+                neural_dim=model_cfg["n_input_features"],
+                hidden_size=int(model_cfg["hidden_size"]),
                 n_days=len(self.args["dataset"]["sessions"]),
                 n_classes=self.args["dataset"]["n_classes"],
-                rnn_dropout=self.args["model"]["rnn_dropout"],
-                input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
-                n_layers=self.args["model"]["n_layers"],
-                patch_size=self.args["model"]["patch_size"],
-                patch_stride=self.args["model"]["patch_stride"],
+                dropout=float(model_cfg.get("dropout", 0.0)),
+                input_dropout=input_dropout,
+                n_layers=model_cfg["n_layers"],
+                patch_size=model_cfg["patch_size"],
+                patch_stride=model_cfg["patch_stride"],
                 phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
+                lagged_mlp_cfg=model_cfg.get("lagged_mlp", None),
             )
             self.logger.info("Initialized MLP decoding model")
+            if getattr(self.model, "lagged_input_mixer", None) is not None:
+                self.logger.info(
+                    f"[MLP] input lagged mixer lags: {self.model.get_lag_values(0)}"
+                )
+            lag_selection_paths = self._save_lag_selection_exports()
+            if lag_selection_paths:
+                self.logger.info(
+                    f"Saved lag selection exports for {len(lag_selection_paths)} block(s) to {self.lag_selection_dir}"
+                )
 
-        elif self.args["model_type"] == "lstm":
+        elif model_type == "lstm":
             self.model = LSTMDecoder(
-                neural_dim=self.args["model"]["n_input_features"],
-                n_units=self.args["model"].get("lstm_hidden_dim", self.args["model"].get("n_units", 0)),
+                neural_dim=model_cfg["n_input_features"],
+                hidden_size=int(model_cfg["hidden_size"]),
                 n_days=len(self.args["dataset"]["sessions"]),
                 n_classes=self.args["dataset"]["n_classes"],
-                rnn_dropout=self.args["model"]["rnn_dropout"],
-                input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
-                n_layers=self.args["model"]["n_layers"],
-                patch_size=self.args["model"]["patch_size"],
-                patch_stride=self.args["model"]["patch_stride"],
+                dropout=float(model_cfg.get("dropout", 0.0)),
+                input_dropout=input_dropout,
+                n_layers=model_cfg["n_layers"],
+                patch_size=model_cfg["patch_size"],
+                patch_stride=model_cfg["patch_stride"],
                 phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
             )
             self.logger.info("Initialized LSTM decoding model")
 
-        elif self.args["model_type"] == "snn":
+        elif model_type == "tcn":
+            self.model = TCNDecoder(
+                neural_dim=model_cfg["n_input_features"],
+                hidden_size=int(model_cfg["hidden_size"]),
+                n_days=len(self.args["dataset"]["sessions"]),
+                n_classes=self.args["dataset"]["n_classes"],
+                dropout=float(model_cfg.get("dropout", 0.0)),
+                input_dropout=input_dropout,
+                n_layers=model_cfg["n_layers"],
+                patch_size=model_cfg["patch_size"],
+                patch_stride=model_cfg["patch_stride"],
+                phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
+                tcn_kernel_size=model_cfg.get("tcn_kernel_size", 3),
+                tcn_dilation_base=model_cfg.get("tcn_dilation_base", 2),
+            )
+            self.logger.info("Initialized TCN decoding model")
+
+        elif model_type == "lssca_snn":
+            self.model = LSSCASNNDecoder(
+                neural_dim=model_cfg["n_input_features"],
+                n_days=len(self.args["dataset"]["sessions"]),
+                n_classes=self.args["dataset"]["n_classes"],
+                input_dropout=input_dropout,
+                lss_window_size=model_cfg.get("lss_window_size", 100),
+                lss_window_stride=model_cfg.get("lss_window_stride", 4),
+                suppress_model_stdout=model_cfg.get("suppress_model_stdout", True),
+            )
+            self.logger.info("Initialized LSS-CA-SNN decoding model")
+
+        elif model_type == "snn":
             if "snn_config" not in self.args or self.args["snn_config"] is None:
                 raise ValueError("snn_config missing but model_type='snn'")
 
@@ -215,15 +274,16 @@ class BrainToTextDecoder_Trainer:
 
             self.model = SpikingModel(
                 cfg=cfg,
-                neural_dim=self.args["model"]["n_input_features"],
+                neural_dim=model_cfg["n_input_features"],
                 n_days=len(self.args["dataset"]["sessions"]),
                 n_classes=self.args["dataset"]["n_classes"],
-                input_dropout=self.args["model"]["input_network"]["input_layer_dropout"],
-                patch_size=self.args["model"]["patch_size"],
-                patch_stride=self.args["model"]["patch_stride"],
+                input_dropout=input_dropout,
+                patch_size=model_cfg["patch_size"],
+                patch_stride=model_cfg["patch_stride"],
                 debug=False,
                 session_adaptation_cfg=session_adapter_cfg,
                 phoneme_transition_bias_cfg=phoneme_transition_bias_cfg,
+                day_adaptation_mode=self.args.get("day_adaptation_mode", "matrix"),
             )
             self.logger.info("Initialized SNN decoding model")
             lag_selection_paths = self._save_lag_selection_exports()
@@ -260,32 +320,63 @@ class BrainToTextDecoder_Trainer:
         self.logger.info(f"Adaptation mode: {self.adaptation_mode}")
 
         # Create datasets and dataloaders
-        train_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_train.hdf5') for s in self.args['dataset']['sessions']]
-        val_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_val.hdf5') for s in self.args['dataset']['sessions']]
-
-        # Ensure that there are no duplicate days
-        if len(set(train_file_paths)) != len(train_file_paths):
-            raise ValueError("There are duplicate sessions listed in the train dataset")
-        if len(set(val_file_paths)) != len(val_file_paths):
-            raise ValueError("There are duplicate sessions listed in the val dataset")
-
-        # Split trials into train and test sets
-        train_trials, _ = train_test_split_indicies(
-            file_paths = train_file_paths, 
-            test_percentage = 0,
-            seed = self.seed,
-            bad_trials_dict = None,
+        custom_split_csv = self.args["dataset"].get("custom_split_csv", None)
+        if custom_split_csv:
+            source_filenames = self.args["dataset"].get(
+                "custom_source_filenames",
+                ["data_train.hdf5", "data_val.hdf5"],
             )
-        _, val_trials = train_test_split_indicies(
-            file_paths = val_file_paths, 
-            test_percentage = 1,
-            seed = self.seed,
-            bad_trials_dict = None,
+            train_trials, val_trials, test_trials = load_trial_indices_from_split_csv(
+                split_csv_path=custom_split_csv,
+                dataset_dir=self.args["dataset"]["dataset_dir"],
+                sessions=self.args["dataset"]["sessions"],
+                source_filenames=source_filenames,
             )
+            self.logger.info(
+                f"Loaded custom split CSV from {custom_split_csv} using source files {source_filenames}"
+            )
+        else:
+            train_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_train.hdf5') for s in self.args['dataset']['sessions']]
+            val_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_val.hdf5') for s in self.args['dataset']['sessions']]
+
+            # Ensure that there are no duplicate days
+            if len(set(train_file_paths)) != len(train_file_paths):
+                raise ValueError("There are duplicate sessions listed in the train dataset")
+            if len(set(val_file_paths)) != len(val_file_paths):
+                raise ValueError("There are duplicate sessions listed in the val dataset")
+
+            # Split trials into train and test sets
+            train_trials, _ = train_test_split_indicies(
+                file_paths = train_file_paths, 
+                test_percentage = 0,
+                seed = self.seed,
+                bad_trials_dict = None,
+                )
+            _, val_trials = train_test_split_indicies(
+                file_paths = val_file_paths, 
+                test_percentage = 1,
+                seed = self.seed,
+                bad_trials_dict = None,
+                )
+            test_trials = None
 
         # Save dictionaries to output directory to know which trials were train vs val 
         with open(os.path.join(self.args['output_dir'], 'train_val_trials.json'), 'w') as f: 
-            json.dump({'train' : train_trials, 'val': val_trials}, f)
+            payload = {'train' : train_trials, 'val': val_trials}
+            if test_trials is not None:
+                payload['test'] = test_trials
+            json.dump(payload, f)
+
+        train_counts = {
+            self.args['dataset']['sessions'][day_idx]: len(train_trials[day_idx].get('trial_refs', train_trials[day_idx].get('trials', [])))
+            for day_idx in train_trials.keys()
+        }
+        val_counts = {
+            self.args['dataset']['sessions'][day_idx]: len(val_trials[day_idx].get('trial_refs', val_trials[day_idx].get('trials', [])))
+            for day_idx in val_trials.keys()
+        }
+        self.logger.info(f"Per-session train counts: {train_counts}")
+        self.logger.info(f"Per-session val counts: {val_counts}")
 
         # Determine if a only a subset of neural features should be used
         feature_subset = None
@@ -362,9 +453,17 @@ class BrainToTextDecoder_Trainer:
         if self.args['init_from_checkpoint']:
             self.load_model_checkpoint(self.args['init_checkpoint_path'])
 
-        # Set rnn and/or input layers to not trainable if specified 
+        # Freeze the shared model trunk and/or day-specific input path when requested.
+        model_trainable = bool(model_cfg.get("trainable", True))
         for name, param in self.model.named_parameters():
-            if not self.args['model']['rnn_trainable'] and ('gru' in name or 'mlp' in name or 'lstm' in name):
+            if not model_trainable and (
+                'gru' in name
+                or 'mlp' in name
+                or 'lstm' in name
+                or 'tcn' in name
+                or (model_type == "snn" and 'day' not in name)
+                or (model_type == "lssca_snn" and name.startswith("backbone."))
+            ):
                 param.requires_grad = False
 
             elif not self.args['model']['input_network']['input_trainable'] and 'day' in name:
@@ -392,6 +491,20 @@ class BrainToTextDecoder_Trainer:
                 self.logger.removeHandler(h)
 
         logging.shutdown()
+
+    def register_validation_observer(self, callback):
+        if callback is None:
+            return
+        self._validation_observers.append(callback)
+
+    def _notify_validation_observers(self, batch_index, epoch_index, val_metrics):
+        for callback in self._validation_observers:
+            callback(
+                batch_index=int(batch_index),
+                epoch_index=int(epoch_index),
+                val_metrics=val_metrics,
+                trainer=self,
+            )
 
     def _to_serializable(self, value):
         if isinstance(value, dict):
@@ -643,6 +756,10 @@ class BrainToTextDecoder_Trainer:
             )
 
     def _save_delay_statistics(self, batch_index, epoch_index, event_name, store_full=True):
+        # Lag snapshot export is disabled because rebuilding/storing full delay
+        # tensors can dominate memory and disk usage for large lag mixers.
+        return []
+
         if self.args.get("model_type") != "snn":
             return []
         if not self.delay_stats_dir:
@@ -673,8 +790,6 @@ class BrainToTextDecoder_Trainer:
         return saved_paths
 
     def _save_lag_selection_exports(self):
-        if self.args.get("model_type") != "snn":
-            return []
         if not self.lag_selection_dir:
             return []
         if not hasattr(self.model, "save_lag_selection_snapshots"):
@@ -688,6 +803,50 @@ class BrainToTextDecoder_Trainer:
 
         return saved_paths
 
+    def _save_delay_parameter_checkpoint(self, batch_index, epoch_index, event_name):
+        if self.args.get("model_type") != "snn":
+            return None
+        if not self.delay_parameter_csv_path:
+            return None
+
+        backbone = getattr(self.model, "backbone", None)
+        if backbone is None or not hasattr(backbone, "append_delay_parameter_checkpoint_csv"):
+            return None
+
+        export_result = backbone.append_delay_parameter_checkpoint_csv(
+            self.delay_parameter_csv_path,
+            epoch=epoch_index,
+            step=batch_index,
+            event_name=event_name,
+            discrete=False,
+        )
+        if not export_result or int(export_result.get("rows_written", 0)) == 0:
+            return export_result
+
+        self.logger.info(
+            f"Saved learned delay parameters to {export_result['path']} "
+            f"(event={event_name}, batch={int(batch_index)}, rows={int(export_result['rows_written'])})"
+        )
+
+        for summary in export_result.get("summaries", []):
+            sample_values = summary.get("sample_values", [])
+            sample_text = ", ".join(f"{float(value):.4f}" for value in sample_values[:5])
+            self.logger.info(
+                "[delay params] "
+                f"event={summary.get('event_name')} "
+                f"step={int(summary.get('step')) if summary.get('step') is not None else 'NA'} "
+                f"block={int(summary.get('block_idx')) if summary.get('block_idx') is not None else 'NA'} "
+                f"param={summary.get('parameter')} "
+                f"shape={summary.get('shape')} "
+                f"min={float(summary.get('min')):.6f} "
+                f"max={float(summary.get('max')):.6f} "
+                f"mean={float(summary.get('mean')):.6f} "
+                f"std={float(summary.get('std')):.6f} "
+                f"sample=[{sample_text}]"
+            )
+
+        return export_result
+
     def _scalar_to_int(self, value):
         if isinstance(value, torch.Tensor):
             return int(value.detach().cpu().item())
@@ -699,6 +858,136 @@ class BrainToTextDecoder_Trainer:
             f"block_{self._scalar_to_int(block_num):04d}_"
             f"trial_{self._scalar_to_int(trial_num):04d}"
         )
+
+    def _ctc_extended_target(self, target, blank_id=0):
+        target = target.to(torch.long)
+        if target.numel() == 0:
+            return torch.tensor([blank_id], dtype=torch.long, device=target.device)
+
+        extended = torch.full(
+            (target.numel() * 2 + 1,),
+            fill_value=blank_id,
+            dtype=torch.long,
+            device=target.device,
+        )
+        extended[1::2] = target
+        return extended
+
+    def _forced_align_ctc_viterbi(self, log_probs, target, blank_id=0):
+        T = int(log_probs.shape[0])
+        if T == 0:
+            return torch.empty(0, dtype=torch.int32)
+
+        target = target.to(device=log_probs.device, dtype=torch.long)
+        if target.numel() == 0:
+            return torch.full((T,), blank_id, dtype=torch.int32)
+
+        ext = self._ctc_extended_target(target, blank_id=blank_id)
+        S = int(ext.shape[0])
+        neg_inf = torch.tensor(-1e30, device=log_probs.device, dtype=log_probs.dtype)
+
+        dp = torch.full((T, S), neg_inf, dtype=log_probs.dtype, device=log_probs.device)
+        backptr = torch.full((T, S), -1, dtype=torch.long, device=log_probs.device)
+
+        dp[0, 0] = log_probs[0, ext[0]]
+        if S > 1:
+            dp[0, 1] = log_probs[0, ext[1]]
+
+        for t in range(1, T):
+            for s in range(S):
+                best_score = dp[t - 1, s]
+                best_prev = s
+
+                if s - 1 >= 0 and dp[t - 1, s - 1] > best_score:
+                    best_score = dp[t - 1, s - 1]
+                    best_prev = s - 1
+
+                if s - 2 >= 0 and ext[s] != blank_id and ext[s] != ext[s - 2]:
+                    if dp[t - 1, s - 2] > best_score:
+                        best_score = dp[t - 1, s - 2]
+                        best_prev = s - 2
+
+                dp[t, s] = best_score + log_probs[t, ext[s]]
+                backptr[t, s] = best_prev
+
+        if S == 1:
+            end_state = 0
+        else:
+            end_state = S - 1 if dp[T - 1, S - 1] >= dp[T - 1, S - 2] else S - 2
+
+        state_path = torch.empty(T, dtype=torch.long, device=log_probs.device)
+        state_path[-1] = end_state
+        for t in range(T - 1, 0, -1):
+            state_path[t - 1] = backptr[t, state_path[t]]
+
+        return ext[state_path].detach().cpu().to(torch.int32)
+
+    def _boundary_and_interior_masks(self, aligned_target, boundary_radius=2, blank_id=0):
+        T = int(aligned_target.numel())
+        boundary = torch.zeros(T, dtype=torch.bool)
+
+        for t in range(1, T):
+            if int(aligned_target[t]) == int(aligned_target[t - 1]):
+                continue
+            start = max(0, t - boundary_radius)
+            end = min(T, t + boundary_radius + 1)
+            boundary[start:end] = True
+
+        interior = (~boundary) & (aligned_target != blank_id)
+        return boundary, interior
+
+    def _build_validation_trial_export_record(
+        self,
+        logits,
+        adjusted_len,
+        day_idx,
+        block_num,
+        trial_num,
+        labels,
+        phone_seq_len,
+        session_id=None,
+        include_alignment=False,
+        boundary_radius=2,
+        blank_id=0,
+    ):
+        valid_len = self._scalar_to_int(adjusted_len)
+        valid_logits = logits[:valid_len].detach().float().cpu()
+        probs = torch.softmax(valid_logits, dim=-1)
+        predictions = probs.argmax(dim=-1).to(torch.int32)
+
+        target_len = self._scalar_to_int(phone_seq_len)
+        target_sequence = labels[:target_len].detach().cpu().to(torch.int32)
+
+        record = {
+            "trial_id": self._build_trial_id(day_idx, block_num, trial_num),
+            "input_length": valid_len,
+            "target_sequence": target_sequence,
+            "target_length": target_len,
+            "logits": valid_logits.to(torch.float32),
+            "probs": probs.to(torch.float32),
+            "predictions": predictions,
+        }
+
+        if session_id is not None:
+            record["session_id"] = self._scalar_to_int(session_id)
+
+        if include_alignment:
+            log_probs = torch.log_softmax(valid_logits, dim=-1)
+            aligned_target = self._forced_align_ctc_viterbi(
+                log_probs=log_probs,
+                target=target_sequence,
+                blank_id=blank_id,
+            )
+            boundary_mask, interior_mask = self._boundary_and_interior_masks(
+                aligned_target=aligned_target,
+                boundary_radius=boundary_radius,
+                blank_id=blank_id,
+            )
+            record["aligned_target"] = aligned_target
+            record["boundary_mask"] = boundary_mask
+            record["interior_mask"] = interior_mask
+
+        return record
 
     def _compute_ctc_evidence_record(
         self,
@@ -1528,8 +1817,8 @@ class BrainToTextDecoder_Trainer:
     
         Day weights should have a separate learning rate
         '''
-        bias_params = [p for name, p in self.model.named_parameters() if name.endswith('.bias')]
         day_params = [p for name, p in self.model.named_parameters() if 'day_' in name]
+        bias_params = [p for name, p in self.model.named_parameters() if 'day_' not in name and name.endswith('.bias')]
         other_params = [p for name, p in self.model.named_parameters() if 'day_' not in name and not name.endswith('.bias')]
         bias_params = [p for p in bias_params if p.requires_grad]
         day_params = [p for p in day_params if p.requires_grad]
@@ -1710,6 +1999,21 @@ class BrainToTextDecoder_Trainer:
         return attention_mask_float
     
     def compute_output_lengths(self, n_time_steps):
+        if self.args.get("model_type") == "lssca_snn":
+            window_size = int(self.args["model"].get("lss_window_size", 100))
+            window_stride = int(self.args["model"].get("lss_window_stride", 4))
+            if window_size <= 0 or window_stride <= 0:
+                raise ValueError(
+                    "lssca_snn requires model.lss_window_size > 0 and model.lss_window_stride > 0"
+                )
+
+            output_lengths = torch.where(
+                n_time_steps >= window_size,
+                (n_time_steps - window_size) // window_stride + 1,
+                torch.ones_like(n_time_steps),
+            )
+            return torch.clamp(output_lengths, min=1).to(torch.int32)
+
         patch_size = int(self.args['model']['patch_size'])
         patch_stride = int(self.args['model']['patch_stride'])
     
@@ -1922,6 +2226,17 @@ class BrainToTextDecoder_Trainer:
                     f"time: {train_step_duration:.3f}"
                 )
 
+            if (
+                self.delay_parameter_export_interval > 0
+                and i > 0
+                and (i % self.delay_parameter_export_interval == 0)
+            ):
+                self._save_delay_parameter_checkpoint(
+                    batch_index=i,
+                    epoch_index=epoch_index,
+                    event_name=f"periodic_{i:07d}",
+                )
+
             # Validation
             if i % self.args["batches_per_val_step"] == 0 or i == (self.args["num_training_batches"] - 1):
                 self.logger.info(f"Running test after training batch: {i}")
@@ -1970,6 +2285,11 @@ class BrainToTextDecoder_Trainer:
                 val_PERs.append(val_metrics["avg_PER"])
                 val_losses.append(val_metrics["avg_loss"])
                 val_results.append(val_metrics)
+                self._notify_validation_observers(
+                    batch_index=i,
+                    epoch_index=epoch_index,
+                    val_metrics=val_metrics,
+                )
 
                 new_best = False
                 if val_metrics["avg_PER"] < self.best_val_PER:
@@ -2051,6 +2371,11 @@ class BrainToTextDecoder_Trainer:
             event_name="final",
             store_full=True,
         )
+        self._save_delay_parameter_checkpoint(
+            batch_index=i,
+            epoch_index=self._active_epoch_index if self._active_epoch_index is not None else 0,
+            event_name="final",
+        )
 
         self.model.eval()
 
@@ -2066,7 +2391,16 @@ class BrainToTextDecoder_Trainer:
         }
         return train_stats
 
-    def validation(self, loader, return_logits = False, return_data = False):
+    def validation(
+        self,
+        loader,
+        return_logits = False,
+        return_data = False,
+        collect_diagnostics = False,
+        export_frame_data = False,
+        include_alignment = False,
+        alignment_boundary_radius = 2,
+    ):
         '''
         Calculate metrics on the validation dataset
         '''
@@ -2091,11 +2425,18 @@ class BrainToTextDecoder_Trainer:
         metrics['trial_nums'] = []
         metrics['day_indicies'] = []
         metrics['ctc_evidence_path'] = None
+        if export_frame_data:
+            metrics['trial_exports'] = []
+            metrics['phoneme_classes'] = list(LOGIT_TO_PHONEME)
 
         ctc_evidence_records = []
 
         total_edit_distance = 0
         total_seq_length = 0
+        total_blank_predictions = 0
+        total_valid_frames = 0
+        spike_rate_sums = defaultdict(float)
+        spike_rate_counts = defaultdict(int)
 
         # Calculate PER for each specific day
         day_per = {}
@@ -2132,6 +2473,22 @@ class BrainToTextDecoder_Trainer:
                     # CTC expects input_lengths <= logits time dim
                     T_out = logits.shape[1]
                     adjusted_lens = torch.clamp(adjusted_lens, max=T_out)
+
+                    if collect_diagnostics:
+                        time_index = torch.arange(T_out, device=logits.device).unsqueeze(0)
+                        valid_mask = time_index < adjusted_lens.unsqueeze(1)
+                        predicted_classes = logits.argmax(dim=-1)
+                        total_blank_predictions += int((predicted_classes[valid_mask] == 0).sum().item())
+                        total_valid_frames += int(valid_mask.sum().item())
+
+                        if self.args.get("model_type") == "snn" and hasattr(self.model, "get_spiking_layer_statistics"):
+                            layer_stats = self.model.get_spiking_layer_statistics() or {}
+                            for layer_name, stats in layer_stats.items():
+                                mean_spike_rate = stats.get("mean_spike_rate")
+                                if mean_spike_rate is None:
+                                    continue
+                                spike_rate_sums[layer_name] += float(mean_spike_rate)
+                                spike_rate_counts[layer_name] += 1
 
                     # sanity check (do once)
                     if i == 0:
@@ -2179,6 +2536,21 @@ class BrainToTextDecoder_Trainer:
                             decoded_seq=decoded_seq,
                         )
                     )
+                    if export_frame_data:
+                        metrics['trial_exports'].append(
+                            self._build_validation_trial_export_record(
+                                logits=logits[iterIdx],
+                                adjusted_len=adjusted_lens[iterIdx],
+                                day_idx=batch['day_indicies'][iterIdx],
+                                block_num=batch['block_nums'][iterIdx],
+                                trial_num=batch['trial_nums'][iterIdx],
+                                labels=labels[iterIdx],
+                                phone_seq_len=phone_seq_lens[iterIdx],
+                                session_id=batch.get("session_ids", None)[iterIdx] if "session_ids" in batch else None,
+                                include_alignment=include_alignment,
+                                boundary_radius=alignment_boundary_radius,
+                            )
+                        )
 
             day = batch['day_indicies'][0].item()
                 
@@ -2212,6 +2584,24 @@ class BrainToTextDecoder_Trainer:
         metrics['avg_PER'] = avg_PER.item()
         metrics['avg_loss'] = np.mean(metrics['losses'])
         metrics['ctc_evidence_path'] = self._save_ctc_evidence_records(ctc_evidence_records, split_name='validation')
+
+        if collect_diagnostics:
+            metrics['blank_ratio'] = (
+                float(total_blank_predictions / total_valid_frames)
+                if total_valid_frames > 0
+                else float("nan")
+            )
+            metrics['spike_rates_by_layer'] = {
+                layer_name: float(spike_rate_sums[layer_name] / spike_rate_counts[layer_name])
+                for layer_name in sorted(spike_rate_sums.keys())
+                if spike_rate_counts[layer_name] > 0
+            }
+            if metrics['spike_rates_by_layer']:
+                metrics['spike_rate'] = float(
+                    np.mean(list(metrics['spike_rates_by_layer'].values()))
+                )
+            else:
+                metrics['spike_rate'] = None
 
         if metrics['ctc_evidence_path'] is not None:
             self.logger.info(f"Saved CTC evidence traces to {metrics['ctc_evidence_path']}")

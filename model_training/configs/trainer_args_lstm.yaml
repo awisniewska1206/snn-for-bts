@@ -1,9 +1,9 @@
 model:
   n_input_features: 512 # number of input features in the neural data. (2 features per electrode, 256 electrodes)
-  n_units: 768 # number of units per GRU layer
-  rnn_dropout: 0.4 # dropout rate for the GRU layers
-  rnn_trainable: true # whether the GRU layers are trainable
-  n_layers: 5 # number of GRU layers
+  hidden_size: 768 # hidden size for the LSTM stack
+  dropout: 0.4 # dropout rate for the LSTM stack
+  trainable: true # whether the LSTM stack is trainable
+  n_layers: 5 # number of LSTM layers
   patch_size: 14 # size of the input patches (14 time steps)
   patch_stride: 4 # stride for the input patches (4 time steps)
 
@@ -18,8 +18,8 @@ gpu_number: '0' # GPU number to use for training, formatted as a string (e.g., '
 mode: train
 use_amp: true # whether to use automatic mixed precision (AMP) for training
 
-output_dir: trained_models/baseline_rnn # directory to save the trained model and logs
-checkpoint_dir: trained_models/baseline_rnn/checkpoint # directory to save checkpoints during training
+output_dir: trained_models/baseline_lstm # directory to save the trained model and logs
+checkpoint_dir: trained_models/baseline_lstm/checkpoint # directory to save checkpoints during training
 init_from_checkpoint: false # whether to initialize the model from a checkpoint
 init_checkpoint_path: None # path to the checkpoint to initialize the model from, if any
 save_best_checkpoint: true # whether to save the best checkpoint based on validation metrics
@@ -29,15 +29,15 @@ save_val_metrics: true # whether to save validation metrics during training
 early_stopping: false # whether to use early stopping based on validation metrics
 early_stopping_val_steps: 20 # number of validation steps to wait before stopping training if no improvement is seen
 
-num_training_batches: 120000 # number of training batches to run
+num_training_batches: 60000 # number of training batches to run
 lr_scheduler_type: cosine # type of learning rate scheduler to use
 lr_max: 0.005 # maximum learning rate for the main model
 lr_min: 0.0001 # minimum learning rate for the main model
-lr_decay_steps: 120000 # number of steps for the learning rate decay
+lr_decay_steps: 60000 # number of steps for the learning rate decay
 lr_warmup_steps: 1000 # number of warmup steps for the learning rate scheduler
 lr_max_day: 0.005 # maximum learning rate for the day specific input layers
 lr_min_day: 0.0001 # minimum learning rate for the day specific input layers
-lr_decay_steps_day: 120000 # number of steps for the learning rate decay for the day specific input layers
+lr_decay_steps_day: 60000 # number of steps for the learning rate decay for the day specific input layers
 lr_warmup_steps_day: 1000 # number of warmup steps for the learning rate scheduler for the day specific input layers
 
 beta0: 0.9 # beta0 parameter for the Adam optimizer

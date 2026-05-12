@@ -6,6 +6,8 @@ import h5py
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 import math 
+import csv
+from collections import defaultdict
 
 class BrainToTextDataset(Dataset):
     '''
@@ -59,12 +61,18 @@ class BrainToTextDataset(Dataset):
         self.n_trials = 0 
         self.trial_indicies = trial_indicies
         self.n_days = len(trial_indicies.keys())
+        self.trial_refs = {}
 
         self.feature_subset = feature_subset
 
         # Calculate total number of trials in the dataset
         for d in trial_indicies:
-            self.n_trials += len(trial_indicies[d]['trials'])
+            self.trial_refs[d] = self._normalize_trial_refs(trial_indicies[d])
+            self.n_trials += len(self.trial_refs[d])
+
+        self.sampleable_train_days = [
+            d for d in self.trial_indicies.keys() if len(self.trial_refs[d]) > 0
+        ]
 
         if must_include_days is not None and len(must_include_days) > days_per_batch:
             raise ValueError(f'must_include_days must be less than or equal to days_per_batch. Received {must_include_days} and days_per_batch {days_per_batch}')
@@ -81,8 +89,14 @@ class BrainToTextDataset(Dataset):
         self.must_include_days = must_include_days    
 
         # Ensure that the days_per_batch is not greater than the number of days in the dataset. Raise error
-        if self.split == 'train' and self.days_per_batch > self.n_days:
-            raise ValueError(f'Requested days_per_batch: {days_per_batch} is greater than available days {self.n_days}.')
+        if self.split == 'train' and len(self.sampleable_train_days) == 0:
+            raise ValueError("No training trials are available for any day in this dataset.")
+
+        if self.split == 'train' and self.days_per_batch > len(self.sampleable_train_days):
+            raise ValueError(
+                f"Requested days_per_batch: {days_per_batch} is greater than available non-empty training days "
+                f"{len(self.sampleable_train_days)}."
+            )
            
         
         if self.split == 'train':
@@ -119,41 +133,35 @@ class BrainToTextDataset(Dataset):
 
         # Iterate through each day in the index
         for d in index.keys():
+            refs_by_session = defaultdict(list)
+            for ref in index[d]:
+                refs_by_session[ref['session_path']].append(ref)
 
-            # Open the hdf5 file for that day
-            with h5py.File(self.trial_indicies[d]['session_path'], 'r') as f:
+            for session_path, refs in refs_by_session.items():
+                with h5py.File(session_path, 'r') as f:
+                    for ref in refs:
+                        try: 
+                            t = int(ref['trial_idx'])
+                            g = f[f'trial_{t:04d}']
 
-                # For each trial in the selected trials in that day
-                for t in index[d]:
-                    
-                    try: 
-                        g = f[f'trial_{t:04d}']
+                            input_features = torch.from_numpy(g['input_features'][:]) # neural data
+                            if self.feature_subset:
+                                input_features = input_features[:,self.feature_subset]
 
-                        # Remove features is neccessary 
-                        input_features = torch.from_numpy(g['input_features'][:]) # neural data
-                        if self.feature_subset:
-                            input_features = input_features[:,self.feature_subset]
-                        '''print(
-                        input_features.shape,
-                        input_features.dtype,
-                        input_features.min().item(),
-                        input_features.max().item()
-                    )'''
+                            batch['input_features'].append(input_features)
 
-                        batch['input_features'].append(input_features)
-
-                        batch['seq_class_ids'].append(torch.from_numpy(g['seq_class_ids'][:]))  # phoneme labels
-                        batch['transcriptions'].append(torch.from_numpy(g['transcription'][:])) # character level transcriptions
-                        batch['n_time_steps'].append(g.attrs['n_time_steps']) # number of time steps in the trial - required since we are padding
-                        batch['phone_seq_lens'].append(g.attrs['seq_len']) # number of phonemes in the label - required since we are padding
-                        batch['day_indicies'].append(int(d)) # day index of each trial - required for the day specific layers 
-                        batch['session_ids'].append(int(d)) # explicit session id alias for session-adaptive components
-                        batch['block_nums'].append(g.attrs['block_num'])
-                        batch['trial_nums'].append(g.attrs['trial_num'])
-                    
-                    except Exception as e:
-                        print(f'Error loading trial {t} from session {self.trial_indicies[d]["session_path"]}: {e}')
-                        continue
+                            batch['seq_class_ids'].append(torch.from_numpy(g['seq_class_ids'][:]))  # phoneme labels
+                            batch['transcriptions'].append(torch.from_numpy(g['transcription'][:])) # character level transcriptions
+                            batch['n_time_steps'].append(g.attrs['n_time_steps']) # number of time steps in the trial - required since we are padding
+                            batch['phone_seq_lens'].append(g.attrs['seq_len']) # number of phonemes in the label - required since we are padding
+                            batch['day_indicies'].append(int(d)) # day index of each trial - required for the day specific layers 
+                            batch['session_ids'].append(int(d)) # explicit session id alias for session-adaptive components
+                            batch['block_nums'].append(g.attrs['block_num'])
+                            batch['trial_nums'].append(g.attrs['trial_num'])
+                        
+                        except Exception as e:
+                            print(f'Error loading trial {ref} from session {session_path}: {e}')
+                            continue
 
         # Pad data to form a cohesive batch
         batch['input_features'] = pad_sequence(batch['input_features'], batch_first = True, padding_value = 0)
@@ -168,6 +176,29 @@ class BrainToTextDataset(Dataset):
         batch['trial_nums'] = torch.tensor(batch['trial_nums'])
 
         return batch
+
+    def _normalize_trial_refs(self, day_payload):
+        if 'trial_refs' in day_payload:
+            return [
+                {
+                    'trial_idx': int(ref['trial_idx']),
+                    'session_path': str(ref['session_path']),
+                }
+                for ref in day_payload['trial_refs']
+            ]
+
+        if 'trials' not in day_payload or 'session_path' not in day_payload:
+            raise ValueError(
+                "Each day payload must contain either {'trials', 'session_path'} or {'trial_refs'}."
+            )
+
+        return [
+            {
+                'trial_idx': int(trial_idx),
+                'session_path': str(day_payload['session_path']),
+            }
+            for trial_idx in day_payload['trials']
+        ]
     
 
     def create_batch_index_train(self):
@@ -179,10 +210,18 @@ class BrainToTextDataset(Dataset):
         '''
 
         batch_index = {}
+        sampleable_days = list(self.sampleable_train_days)
+
+        if self.must_include_days is not None:
+            empty_must_include_days = [d for d in self.must_include_days if len(self.trial_refs.get(d, [])) == 0]
+            if empty_must_include_days:
+                raise ValueError(
+                    f"must_include_days contains day indices with no training trials: {empty_must_include_days}"
+                )
 
         # Precompute the days that are not in must_include_days
         if self.must_include_days is not None:
-            non_must_include_days = [d for d in self.trial_indicies.keys() if d not in self.must_include_days]
+            non_must_include_days = [d for d in sampleable_days if d not in self.must_include_days]
 
         for batch_idx in range(self.n_batches):
             batch = {}
@@ -206,7 +245,7 @@ class BrainToTextDataset(Dataset):
             
             # Otherwise we will select random days without replacement
             else: 
-                days = self.rng.choice(list(self.trial_indicies.keys()), size=self.days_per_batch, replace=False)
+                days = self.rng.choice(sampleable_days, size=self.days_per_batch, replace=False)
             
             # How many trials will be sampled from each day
             num_trials = math.ceil(self.batch_size / self.days_per_batch) # Use ceiling to make sure we get at least batch_size trials
@@ -214,8 +253,8 @@ class BrainToTextDataset(Dataset):
             for d in days:
 
                 # Trials are sampled with replacement, so if a day has less than (self.batch_size / days_per_batch trials) trials, it won't be a problem
-                trial_idxs = self.rng.choice(self.trial_indicies[d]['trials'], size=num_trials, replace=True)
-                batch[d] = trial_idxs
+                ref_indices = self.rng.choice(len(self.trial_refs[d]), size=num_trials, replace=True)
+                batch[d] = [self.trial_refs[d][int(ref_idx)] for ref_idx in ref_indices]
 
             # Remove extra trials
             extra_trials = (num_trials * len(days)) - self.batch_size
@@ -244,7 +283,7 @@ class BrainToTextDataset(Dataset):
         for d in self.trial_indicies.keys():
 
             # Calculate how many batches we need for this day
-            num_trials = len(self.trial_indicies[d]['trials'])
+            num_trials = len(self.trial_refs[d])
             num_batches = (num_trials + self.batch_size - 1) // self.batch_size 
             
             # Create batches for this day
@@ -253,7 +292,7 @@ class BrainToTextDataset(Dataset):
                 end_idx = min((i + 1) * self.batch_size, num_trials)
                 
                 # Get the trial indices for this batch
-                batch_trials = self.trial_indicies[d]['trials'][start_idx:end_idx]
+                batch_trials = self.trial_refs[d][start_idx:end_idx]
                 
                 # Add to batch_index
                 batch_index[batch_idx] = {d : batch_trials}
@@ -353,3 +392,153 @@ def train_test_split_indicies(file_paths, test_percentage = 0.1, seed = -1, bad_
             test_trials[day] = {'trials' : test_indices, 'session_path' : trials_per_day[day]['session_path']}
     
     return train_trials, test_trials
+
+
+def _session_name_to_date(session_name):
+    parts = session_name.split(".")
+    if len(parts) < 4:
+        raise ValueError(f"Session name does not match expected pattern: {session_name}")
+    return f"{parts[1]}-{parts[2]}-{parts[3]}"
+
+
+def _discover_session_trial_refs(dataset_dir, session_name, source_filenames):
+    session_dir = Path(dataset_dir) / session_name
+    block_trials = defaultdict(list)
+
+    for source_name in source_filenames:
+        source_path = session_dir / source_name
+        if not source_path.exists():
+            continue
+
+        with h5py.File(source_path, "r") as handle:
+            for trial_key in handle.keys():
+                trial_idx = int(trial_key.split("_")[-1])
+                attrs = handle[trial_key].attrs
+                block_num = int(attrs["block_num"])
+                trial_num = int(attrs["trial_num"])
+                block_trials[block_num].append(
+                    {
+                        "trial_idx": trial_idx,
+                        "trial_num": trial_num,
+                        "session_path": str(source_path),
+                    }
+                )
+
+    for block_num in block_trials:
+        block_trials[block_num].sort(
+            key=lambda item: (item["trial_num"], item["trial_idx"], item["session_path"])
+        )
+
+    return block_trials
+
+
+def load_trial_indices_from_split_csv(
+    split_csv_path,
+    dataset_dir,
+    sessions,
+    source_filenames=None,
+):
+    if source_filenames is None:
+        source_filenames = ["data_train.hdf5", "data_val.hdf5", "data_test.hdf5"]
+
+    split_csv_path = Path(split_csv_path)
+    dataset_dir = Path(dataset_dir)
+
+    rows_by_date = defaultdict(lambda: defaultdict(list))
+    with split_csv_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"date", "split", "block_number", "sentence_in_block"}
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"Split CSV is missing required columns: {sorted(missing)}"
+            )
+
+        for row_idx, row in enumerate(reader):
+            enriched_row = dict(row)
+            enriched_row["_row_idx"] = int(row_idx)
+            rows_by_date[row["date"]][row["split"]].append(enriched_row)
+
+    split_payloads = {"train": {}, "val": {}, "test": {}}
+    session_date_map = {session: _session_name_to_date(session) for session in sessions}
+
+    for day_idx, session_name in enumerate(sessions):
+        date = session_date_map[session_name]
+        block_trials = _discover_session_trial_refs(
+            dataset_dir=dataset_dir,
+            session_name=session_name,
+            source_filenames=source_filenames,
+        )
+        used_keys = set()
+        split_rows = rows_by_date.get(date, {})
+        rows_by_block = defaultdict(list)
+        for split_name in ("train", "val", "test"):
+            for row in split_rows.get(split_name, []):
+                rows_by_block[int(row["block_number"])].append(row)
+
+        row_to_trial_ref = {}
+        for block_number, requested_rows in rows_by_block.items():
+            ordered_requested_rows = sorted(
+                requested_rows,
+                key=lambda row: (
+                    int(row["sentence_in_block"]),
+                    int(row.get("sentence_index_in_day", 0)),
+                    int(row["_row_idx"]),
+                ),
+            )
+            block_records = block_trials.get(block_number, [])
+            available_count = len(block_records)
+            requested_count = len(ordered_requested_rows)
+            matched_count = min(requested_count, available_count)
+
+            if requested_count != available_count:
+                print(
+                    f"[split-loader] session={session_name} block={block_number}: "
+                    f"requested {requested_count} sentence slots from CSV but found "
+                    f"{available_count} trial(s) in HDF5. Using first {matched_count} by rank order."
+                )
+
+            for row, chosen in zip(ordered_requested_rows[:matched_count], block_records[:matched_count]):
+                unique_key = (chosen["session_path"], chosen["trial_idx"])
+                if unique_key in used_keys:
+                    raise ValueError(
+                        f"Duplicate trial assignment detected for session={session_name}, "
+                        f"block={block_number}, trial_idx={chosen['trial_idx']}."
+                    )
+                used_keys.add(unique_key)
+                row_to_trial_ref[int(row["_row_idx"])] = {
+                    "trial_idx": int(chosen["trial_idx"]),
+                    "session_path": str(chosen["session_path"]),
+                }
+
+            if requested_count > available_count:
+                dropped_rows = ordered_requested_rows[matched_count:]
+                if dropped_rows:
+                    dropped_desc = ", ".join(
+                        str(int(row["sentence_in_block"])) for row in dropped_rows[:8]
+                    )
+                    suffix = "..." if len(dropped_rows) > 8 else ""
+                    print(
+                        f"[split-loader] dropped {len(dropped_rows)} row(s) for session={session_name}, "
+                        f"block={block_number}; sentence_in_block values: {dropped_desc}{suffix}"
+                    )
+
+        for split_name in split_payloads.keys():
+            day_rows = rows_by_date.get(date, {}).get(split_name, [])
+            ordered_rows = sorted(
+                day_rows,
+                key=lambda row: int(row.get("sentence_index_in_day", 0)),
+            )
+            trial_refs = []
+            for row in ordered_rows:
+                chosen = row_to_trial_ref.get(int(row["_row_idx"]))
+                if chosen is None:
+                    continue
+                trial_refs.append(chosen)
+
+            split_payloads[split_name][day_idx] = {
+                "trial_refs": trial_refs,
+                "session_path": str((dataset_dir / session_name)),
+            }
+
+    return split_payloads["train"], split_payloads["val"], split_payloads["test"]

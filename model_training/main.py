@@ -10,6 +10,7 @@ import torch
 from omegaconf import OmegaConf
 
 from trainer import BrainToTextDecoder_Trainer
+from utils.model_config import canonicalize_model_type, ensure_model_config_schema
 from utils.seeding import set_global_seed
 
 
@@ -65,7 +66,11 @@ def remove_dir_with_retry(path: str, retries: int = 5, delay: float = 1.0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["rnn", "snn", "mlp", "lstm"], required=True)
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Model family to train. Use 'gru', 'snn', 'mlp', 'lstm', 'tcn', or 'lssca_snn'. 'rnn' is accepted as a legacy alias for 'gru'.",
+    )
     parser.add_argument("--trainer_config", required=True)
     parser.add_argument("--snn_config", default=None)
     parser.add_argument("--gpu", default="0")
@@ -84,16 +89,22 @@ def main():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args_cli.gpu
 
+    model_name = canonicalize_model_type(args_cli.model)
+    valid_models = {"gru", "snn", "mlp", "lstm", "tcn", "lssca_snn"}
+    if model_name not in valid_models:
+        raise ValueError(f"Unsupported model '{args_cli.model}'. Expected one of: {sorted(valid_models)}")
+
     trainer_cfg = OmegaConf.load(args_cli.trainer_config)
     trainer_cfg.mode = "train"
     trainer_cfg.gpu_number = args_cli.gpu
-    trainer_cfg.model_type = args_cli.model
+    trainer_cfg.model_type = model_name
     trainer_cfg.tag = args_cli.tag
+    ensure_model_config_schema(trainer_cfg.model)
     if args_cli.seed is not None:
         trainer_cfg.seed = int(args_cli.seed)
 
     snn_cfg = None
-    if args_cli.model == "snn":
+    if model_name == "snn":
         if args_cli.snn_config is None:
             raise ValueError("--snn_config is required when --model snn")
         snn_cfg = OmegaConf.load(args_cli.snn_config)
@@ -106,10 +117,10 @@ def main():
         torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-    suffix = args_cli.run_name if args_cli.run_name else args_cli.model
+    suffix = args_cli.run_name if args_cli.run_name else model_name
     run_name = f"{ts}_{suffix}_pid{os.getpid()}"
 
-    final_root = f"logs/{args_cli.model}"
+    final_root = f"logs/{model_name}"
     tmp_root = "logs/.tmp"
 
     final_output_dir = os.path.join(final_root, run_name)
@@ -138,7 +149,8 @@ def main():
 
     launch_info = {
         "timestamp": ts,
-        "model": args_cli.model,
+        "model": model_name,
+        "requested_model": args_cli.model,
         "gpu": args_cli.gpu,
         "seed": run_seed,
         "trainer_config": args_cli.trainer_config,
