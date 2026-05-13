@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+logs_final/
 logs/
 data/
 language_model/
