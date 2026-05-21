@@ -1,0 +1,6 @@
+model_family,size_config,split_iteration,seed,tag,status
+snn,lag_01,0,20,snn_lag_01_split0_seed20,fail
+snn,lag_01,0,20,snn_lag_01_split0_seed20,fail
+snn,lag_01,0,20,snn_lag_01_split0_seed20,fail
+snn,lag_01,0,20,snn_lag_01_split0_seed20,success
+snn,lag_01,0,20,snn_lag_01_split0_seed20,success

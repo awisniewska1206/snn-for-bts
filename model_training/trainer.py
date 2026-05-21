@@ -12,7 +12,7 @@ import json
 import yaml
 from collections import defaultdict
 import h5py
-from model_training.models.snn_backbone import SpikingModel
+from models.snn_backbone import SpikingModel
 import pickle
 
 from helpers.dataset import (
@@ -1044,7 +1044,7 @@ class BrainToTextDecoder_Trainer:
 
         save_path = os.path.join(
             self.ctc_evidence_dir,
-            f'{split_name}_run_{self._validation_run_index:04d}.pt',
+            f'{split_name}_last.pt',
         )
 
         payload = {

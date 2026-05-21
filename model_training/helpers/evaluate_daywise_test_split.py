@@ -23,11 +23,11 @@ from helpers.evaluate_model_helpers import LOGIT_TO_PHONEME
 from trainer import BrainToTextDecoder_Trainer
 from utils.seeding import make_dataloader_generator, seed_worker, set_global_seed
 
+# python model_training/helpers/evaluate_daywise_test_split.py --model_path model_training/logs/snn/2026-05-21_09-58-21_717396_snn_pid7933/ --split_number 0 --gpu_number 0
 
 GLOBAL_SEED = 20
 SPLIT_METRICS_PATTERN = re.compile(r"daywise_test_split_(\d+)_metrics\.json$")
 DISPLAY_SKIP_PHONEMES = {"BLANK", " | "}
-
 
 def reset_memory_tracking(device):
     if getattr(device, "type", None) != "cuda":

@@ -14,6 +14,8 @@ except ImportError:
 
 from utils.model_config import canonicalize_model_type, ensure_model_config_schema
 
+# python model_training/optimize_snn_hparams.py --model_type snn --gpu 0
+
 DAILY_PARAMS = 11_819_520
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -28,7 +30,7 @@ DEFAULT_TRAINER_CONFIGS = {
     "rnn": SCRIPT_DIR / "configs" / "trainer_args_gru.yaml",
     "tcn": SCRIPT_DIR / "configs" / "trainer_args_tcn.yaml",
 }
-DEFAULT_SNN_CONFIG = SCRIPT_DIR / "configs" / "spikachu_alternative.yaml"
+DEFAULT_SNN_CONFIG = SCRIPT_DIR / "configs" / "snn_specific_args.yaml"
 
 TARGET_CORE_PARAMS = 500_000
 TARGET_PARAMS = DAILY_PARAMS + TARGET_CORE_PARAMS

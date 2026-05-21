@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from spikingjelly.activation_based import functional as sj_functional
 
-from model_training.models.snn_modules_alternative_core import SpikingNeuralNet
+from models.snn_modules_alternative_core import SpikingNeuralNet
 from models.phoneme_transition_bias import build_phoneme_transition_bias
 
 class DayLayerNorm(nn.Module):

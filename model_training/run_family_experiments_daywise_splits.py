@@ -10,8 +10,7 @@ from omegaconf import OmegaConf
 
 from utils.model_config import canonicalize_model_type
 
-# python run_family_experiments_daywise_splits.py   --model snn   --gpu 0   --seed 20   --split_dir data/daywise_sentence_splits --split_iterations 4
-GLOBAL_SEED = 20
+# python model_training/run_family_experiments_daywise_splits.py   --model snn   --gpu 0   --seed 20   --split_dir data/daywise_sentence_splits --split_iterations 0
 DEFAULT_SPLIT_ITERATIONS = [0]
 DELAY_SECONDS = 5
 
@@ -26,11 +25,11 @@ BASE_CONFIGS = {
     "tcn": SCRIPT_DIR / "configs" / "trainer_args_tcn.yaml",
     "lssca_snn": SCRIPT_DIR / "configs" / "trainer_args_lssca_snn.yaml",
     "gru": SCRIPT_DIR / "configs" / "trainer_args_gru.yaml",
-    "snn": SCRIPT_DIR / "configs" / "trainer_args_snn_best.yaml",
+    "snn": SCRIPT_DIR / "configs" / "trainer_args_snn.yaml",
 }
 
 SNN_CONFIGS = {
-    "snn": SCRIPT_DIR / "configs" / "spikachu_alternative.yaml",
+    "snn": SCRIPT_DIR / "configs" / "snn_specific_args.yaml",
 }
 
 SIZE_OVERRIDES = {
@@ -346,7 +345,7 @@ def main():
         split_iterations=split_iterations,
     )
 
-    with TemporaryDirectory(prefix=f"{model_name}_family_daywise_", dir=SCRIPT_DIR) as temp_dir_name:
+    with TemporaryDirectory(prefix=f"{model_name}_family_daywise_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         run_index = 0
 

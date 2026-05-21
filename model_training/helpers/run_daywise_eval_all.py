@@ -14,7 +14,7 @@ from pathlib import Path
 DEFAULT_RUNS_DIR = "logs/lstm"
 DEFAULT_EVAL_SCRIPT = Path(__file__).with_name("evaluate_daywise_test_split.py")
 #SPLITS = [0, 1, 2, 3, 4]*3  # Will cycle through splits if more than 5 runs
-SPLITS = [0, 1, 2, 3, 4]
+SPLITS = [0]
 
 def parse_args():
     parser = argparse.ArgumentParser(

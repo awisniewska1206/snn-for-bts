@@ -1,0 +1,38 @@
+experiment_tag: SpikingJelly_snn_hybrid
+seed: 20
+wandb_mode: disabled
+model:
+  type: SpikingJellySNN
+  enable_benchmarking: true
+  setup:
+    surrogate: atan
+    backend: cupy
+    input_size: 512
+    hidden_size: 512
+    output_size: 41
+    patch_size: 6
+    patch_stride: 4
+    snn_core:
+      tau: 3.8141388544553707
+      v_threshold: 0.8189617827585671
+      v_reset: 0.0
+      n_blocks: 4
+      p_drop: 0.019177925237584048
+      lagged_lags:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      lagged_one_random_lag_per_pair: true
+      lagged_num_lags_per_connection: 1
+      lagged_distribution_type: uniform
+      lagged_decay_strength: 0.0
+    neuron_adaptation:
+      enabled: false
+      learn_threshold: false
+      learn_tau: false
+save_path: logs/
